@@ -21,6 +21,7 @@ import { SecureStorage } from '@/services/storage/SecureStorage';
 import { v4 as uuid } from 'uuid';
 import { getLogger } from '@/utils/logger';
 import { IDLE_TIMEOUT_MS } from '@/utils/constants';
+import type { ActivationParams } from './UrlSchemeHandler';
 
 const log = getLogger('WakeUpManager');
 
@@ -29,10 +30,19 @@ let idleTimer: ReturnType<typeof setTimeout> | null = null;
 export class WakeUpManager {
   /**
    * Full activation sequence
+   * @param params Optional activation parameters (e.g., from URL scheme)
    */
-  async activate(): Promise<void> {
+  async activate(params?: ActivationParams): Promise<void> {
     const appStore = useAppStore.getState();
     const sessionStore = useSessionStore.getState();
+
+    // If a specific gateway ID was requested, try to activate it
+    if (params?.gatewayId) {
+      const gw = appStore.config.gateways.find((g) => g.id === params.gatewayId);
+      if (gw) {
+        appStore.setActiveGateway(gw);
+      }
+    }
 
     const gateway = appStore.activeGateway;
     if (!gateway) {
