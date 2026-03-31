@@ -106,7 +106,7 @@ export class FeishuPushService {
     }
   }
 
-  private static async pushTurnDirect(payload: FeishuCardPayload): Promise<boolean> {
+  static async pushTurnDirect(payload: FeishuCardPayload): Promise<boolean> {
     const config = useAppStore.getState().config.feishu;
     if (!config.webhookUrl) return false;
 

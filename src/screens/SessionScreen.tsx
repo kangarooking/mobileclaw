@@ -1,10 +1,12 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useCallback } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
 import { useSessionStore } from '@/store/useSessionStore';
 import { useAppStore } from '@/store/useAppStore';
 import { ChatLogList } from '@/components/chat/ChatLogList';
 import { StatusIndicator } from '@/components/common/StatusIndicator';
+import CameraPreview from '@/components/camera/CameraPreview';
 import { wakeUpManager } from '@/services/wake/WakeUpManager';
+import { cameraManager } from '@/services/camera/CameraManager';
 import { IDLE_TIMEOUT_MS, IDLE_WARNING_MS } from '@/utils/constants';
 
 export function SessionScreen({ navigation }: { navigation: any }) {
@@ -18,6 +20,17 @@ export function SessionScreen({ navigation }: { navigation: any }) {
   const idleTimeMs = Date.now() - lastActivityAt;
   const isIdleWarning = idleTimeMs > IDLE_WARNING_MS && idleTimeMs < IDLE_TIMEOUT_MS;
   const idleSeconds = Math.max(0, Math.round((IDLE_TIMEOUT_MS - idleTimeMs) / 1000));
+
+  // Track frames received for display
+  const receivedFramesRef = useRef(0);
+
+  const handleFrameReady = useCallback((
+    _jpegBase64: string,
+    width: number,
+    height: number,
+  ) => {
+    receivedFramesRef.current++;
+  }, []);
 
   return (
     <View style={styles.container}>
@@ -38,23 +51,27 @@ export function SessionScreen({ navigation }: { navigation: any }) {
         </TouchableOpacity>
       </View>
 
-      {/* Camera preview placeholder (~55% of screen) */}
-      <View style={styles.cameraContainer}>
-        {/* TODO: Replace with actual CameraPreview component using react-native-vision-camera */}
-        <View style={styles.cameraPlaceholder}>
-          <Text style={styles.cameraPlaceholderText}>
-            {isCameraActive ? '📷 Camera Active' : '📷 Camera Standby'}
-          </Text>
-          {isCameraActive && (
-            <View style={styles.recordingOverlay}>
-              <Text style={styles.recordingText}>🎙️ Listening...</Text>
-            </View>
-          )}
-        </View>
+      {/* Camera preview (~55% of screen) */}
+      <View style={[styles.cameraContainer, mode === 'active' && styles.cameraActiveBorder]}>
+        <CameraPreview
+          isActive={isCameraActive}
+          onFrameReady={handleFrameReady}
+        />
+
+        {/* ASR listening overlay */}
+        {mode === 'active' && (
+          <View style={styles.recordingOverlay}>
+            <View style={styles.recordingDot} />
+            <Text style={styles.recordingText}>
+              {currentTranscript ? '🎙️ Listening...' : '🎙️ Ready'}
+            </Text>
+          </View>
+        )}
+
         {/* Frame counter for debugging */}
         {mode === 'active' && (
           <Text style={styles.frameCounter}>
-            Frames: {framesSentCount}
+            📷 {receivedFramesRef.current} frames · ↑{framesSentCount}
           </Text>
         )}
       </View>
@@ -125,27 +142,29 @@ const styles = StyleSheet.create({
     marginTop: 8,
     borderRadius: 16,
     overflow: 'hidden',
-    borderWidth: mode => (mode === 'active' ? 2 : 0),
+    borderWidth: 2,
+    borderColor: 'transparent',
+  },
+  cameraActiveBorder: {
     borderColor: '#22c55e',
-  },
-  cameraPlaceholder: {
-    flex: 1,
-    backgroundColor: '#111',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  cameraPlaceholderText: {
-    color: '#555',
-    fontSize: 16,
   },
   recordingOverlay: {
     position: 'absolute',
     bottom: 40,
     alignSelf: 'center',
-    backgroundColor: 'rgba(0,0,0,0.6)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
     borderRadius: 20,
     paddingHorizontal: 16,
     paddingVertical: 8,
+    gap: 8,
+  },
+  recordingDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: '#ef4444',
   },
   recordingText: {
     color: '#3b82f6',
@@ -154,10 +173,15 @@ const styles = StyleSheet.create({
   },
   frameCounter: {
     position: 'absolute',
-    top: 8,
-    right: 8,
-    color: '#444',
+    top: 10,
+    right: 10,
+    color: '#22c55e',
     fontSize: 11,
+    fontFamily: 'monospace',
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    paddingHorizontal: 6,
+    paddingVertical: 3,
+    borderRadius: 6,
   },
   chatContainer: {
     flex: 1,

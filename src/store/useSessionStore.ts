@@ -80,7 +80,7 @@ export const useSessionStore = create<SessionStateStore>((set, get) => ({
   appendToTranscript: (text) =>
     set((state) => ({ currentTranscript: state.currentTranscript + text })),
   commitTranscript: () => {
-    const { currentTranscript, hasVideoContext } = get();
+    const { currentTranscript } = get();
     if (!currentTranscript.trim()) return;
 
     const userMsg: ChatMessage = {

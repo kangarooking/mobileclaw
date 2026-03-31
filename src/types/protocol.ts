@@ -158,8 +158,3 @@ export interface TTSConvertParams {
   outputFormat?: string;
 }
 
-/** chat.send — WebChat-native send */
-export interface ChatSendParams {
-  message: string;
-  sessionKey?: string;
-}

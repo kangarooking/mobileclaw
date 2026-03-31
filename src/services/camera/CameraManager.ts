@@ -1,24 +1,23 @@
 /**
  * CameraManager — Camera lifecycle management
  *
- * Manages react-native-vision-camera device selection, format configuration,
+ * Manages react-native-vision-camera v4 device selection,
  * and coordinates with FrameProcessor for real-time frame capture.
  */
 
-import { Camera, type CameraDevice, type CameraDeviceFormat } from 'react-native-vision-camera';
-import { getLogger } from '@/utils/constants';
+import { Camera } from 'react-native-vision-camera';
+import { getLogger } from '@/utils/logger';
 
 const log = getLogger('CameraManager');
 
 export class CameraManager {
-  private device: CameraDevice | null = null;
-  private format: CameraDeviceFormat | null = null;
+  private device: unknown = null;
   private isRunning = false;
 
-  /** Latest captured JPEG frame (base64), updated by frame processor */
+  /** Latest captured frame data (base64 string), updated by frame processor */
   public latestFrame: string | null = null;
   public latestFrameTimestamp: number = 0;
-  public onFrameReady: ((jpegBase64: string, width: number, height: number, timestamp: number) => void) | null = null;
+  public onFrameReady: ((dataBase64: string, width: number, height: number, timestamp: number) => void) | null = null;
 
   async initialize(): Promise<void> {
     const cameraPermission = await Camera.requestCameraPermission();
@@ -26,34 +25,21 @@ export class CameraManager {
       throw new Error('Camera permission denied');
     }
 
-    // Get back camera (prefer wide-angle or first available)
-    const devices = Camera.getAvailableCameraDevices('back');
+    // Get all camera devices and pick back camera (v4 API: no args, filter by position)
+    const allDevices = Camera.getAvailableCameraDevices();
     this.device =
-      devices.find((d) => d.supportsLowLightBoost) ?? devices[0];
+      allDevices.find((d: any) => d.position === 'back') ??
+      allDevices[0] ?? null;
 
     if (!this.device) {
       throw new Error('No back camera available');
     }
 
-    // Find best matching format
-    this.format = this.device.supportedFormats.find(
-      (f) =>
-        f.videoWidth === 640 &&
-        f.videoHeight === 480 &&
-        f.frameRateRanges.some((r) => r.maxFrameRate >= 15),
-    ) ?? this.device.supportedFormats[0];
-
-    log.info(
-      `Camera initialized: ${this.device?.deviceName}, format: ${this.format?.videoWidth}x${this.format?.videoHeight}`,
-    );
+    log.info('Camera initialized: device found');
   }
 
-  getDevice(): CameraDevice | null {
+  getDevice(): unknown {
     return this.device;
-  }
-
-  getFormat(): CameraDeviceFormat | null {
-    return this.format;
   }
 
   setRunning(running: boolean): void {
@@ -65,12 +51,12 @@ export class CameraManager {
   }
 
   /**
-   * Called by the frame processor worklet when a new JPEG frame is ready
+   * Called by the frame processor worklet when a new frame is ready.
    */
-  onNewFrame(jpegBase64: string, width: number, height: number, timestamp: number): void {
-    this.latestFrame = jpegBase64;
+  onNewFrame(dataBase64: string, width: number, height: number, timestamp: number): void {
+    this.latestFrame = dataBase64;
     this.latestFrameTimestamp = timestamp;
-    this.onFrameReady?.(jpegBase64, width, height, timestamp);
+    this.onFrameReady?.(dataBase64, width, height, timestamp);
   }
 }
 
