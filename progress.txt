@@ -55,5 +55,56 @@
   - 下一优先任务：feat-02 GatewayClient 对接本地 openclaw 真实连接测试
 
 ----------------------------------------
+会话 #1 - feat-02 GatewayClient 真实连接 + 协议深度对接
+----------------------------------------
+时间: 2026-03-31
+
+完成工作:
+  [x] feat-02: GatewayClient 对接本地 openclaw :18789，完成真实连接握手和 RPC 调用测试
+  [x] 修复 3 个代码 bug：crypto.randomUUID()→uuid()、FeishuPushService 循环依赖、模板字面量
+  [x] 编写 Node.js 测试脚本（scripts/test-gateway-connection.mjs）验证完整连接流程
+  [x] 深入研究 openclaw 源码，理解设备身份认证机制
+
+协议发现（关键！影响后续所有功能）：
+  - client.id 必须是预定义枚举值（12个），iOS 客户端用 'openclaw-ios'（不能自定义如 'mobileclaw-ios'）
+  - client.mode 枚举值：'webchat'|'cli'|'ui'|'backend'|'node'|'probe'|'test'
+    MobileClaw 作为 UI 客户端应使用 'ui'
+  - 设备身份（Device Identity）是获取 operator.write 权限的**必要条件**
+    无 device → scopes 被清空为 [] → 所有 RPC 返回 "missing scope"
+  - 设备身份使用 Ed25519 签名算法（非 ECDSA P-256！）
+  - v3 签名 payload 格式：v3|deviceId|clientId|clientMode|role|scopes|signedAtMs|token|nonce|platform_norm|deviceFamily_norm
+  - **关键坑**：connectParams.client 中的字段必须与签名 payload 中使用的完全一致
+    否则服务端重建的 payload 与客户端签名的不匹配 → "device signature invalid"
+    特别是 deviceFamily：如果在签名中用了 'iPhone'，connectParams.client 也必须有 deviceFamily:'iPhone'
+  - AI 对话方法为 chat.send（sessionKey+message+idempotencyKey）
+    send 方法是给 WhatsApp/SMS 等频道消息用的（需要 to+channel 参数）
+  - sessionKey 格式：'agentId:channel:peer'（至少3段冒号分隔），如 'main:webchat:mobileclaw'
+  - 首次连接新设备自动静默配对（local client + shared auth → silent auto-approve）
+  - 已配对设备请求更多 scope 时需重新配对
+
+测试结果（11/11 通过）：
+  ✅ TCP 连接到 ws://127.0.0.1:18789
+  ✅ 收到 connect.challenge 事件（含 nonce）
+  ✅ 发送 connect 请求（含 Ed25519 设备身份 + v3 签名 payload）
+  ✅ 收到 hello-ok 响应（protocol:3, server version, features list）
+  ✅ 获取 deviceToken + operator.read + operator.write 权限
+  ✅ health RPC 成功返回（111 个可用方法、24 个事件、defaultAgentId: main）
+  ✅ chat.send RPC 成功 — AI 回复："Hey! I'm here and ready to go — looks like this is our first chat. 👋"
+  ✅ 流式事件正常接收：agent lifecycle (start→streaming→end)、chat delta/final messages
+  ✅ 心跳 tick 事件正常接收
+  ✅ WebSocket 优雅关闭（code 1000）
+
+GatewayClient 更新内容：
+  - 新增 DeviceIdentity 接口和 setDeviceIdentity() 方法
+  - 新增 chatSend() 便捷方法（封装 chat.send RPC 的正确参数格式）
+  - sendConnectRequest() 支持带设备身份的连接请求
+  - 修复所有已知 bug，添加详细注释说明协议要求
+
+下一步:
+  - feat-03: 集成 react-native-vision-camera 实现真实相机预览和帧捕获
+  - feat-09: 实现 SecureStorage 原生模块（Ed25519 密钥对需要安全存储）
+  - 注意：RN 环境下 Ed25519 签名需要原生 TurboModule（Node.js crypto 不可用）
+
+----------------------------------------
 （后续会话在此追加，格式如下）
 ----------------------------------------
