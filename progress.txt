@@ -158,5 +158,64 @@ TS 编译状态:
   - feat-05: 音频录制管线（AudioSession + PCM 采集 + 波形可视化）
 
 ----------------------------------------
+会话 #3 - feat-04 双策略帧发送 + feat-05 音频录制管线
+----------------------------------------
+时间: 2026-03-31
+
+完成工作:
+  [x] feat-04: 双策略视频帧发送（Strategy A 快照附件 + Strategy B 连续事件流）
+  [x] feat-05: 音频录制管线（AudioSession 配置 + PCM 录制 + 波形可视化）
+
+feat-04 详细:
+  frameSender.ts 重写:
+  - Strategy A: getLatestFrameAttachment() 返回标准 chat.send attachments 格式
+    (type/mimeType/fileName/content/meta)，hasFreshFrame() 检查帧新鲜度（3s 内）
+  - Strategy B: startContinuousStream() 发送 video_frame 事件
+    自动递增 framesSentCount store 计数器
+    使用 CameraManager 实际帧尺寸（不再硬编码 640x480）
+
+  WakeUpManager 关键修复:
+  - sendUserMessage() 从 rpc('send', ...) 改为 chatSend()
+    （'send' 是 WhatsApp/SMS 频道消息方法，AI 对话必须用 'chat.send'）
+  - attachments 使用标准格式数组（非裸 image 字段）
+  - activate() 中启动 Strategy B: frameSender.startContinuousStream()
+
+  CameraManager 增强:
+  - 新增 latestFrameWidth/latestFrameHeight 跟踪实际帧尺寸
+
+feat-05 详细:
+  新增依赖: expo-av 16.0.8
+
+  AudioManager.ts 重写（从占位符→真实实现）:
+  - configureSession(): Audio.setAudioModeAsync()
+    iOS: PlayAndRecord category + voiceChat mode + doNotMix interruption
+    Android: MODE_IN_COMMUNICATION + GAIN_TRANSIENT_MAY_DUCK
+  - startRecording()/stopRecording(): Audio.Recording 类
+    麦克风权限请求、HighQuality preset、PCM INT16 配置
+  - onVolumeUpdate(listener): 50ms 间隔音量电平回调
+    dB → 0-1 归一化（-60dB~0dB 范围），驱动 WaveformView
+
+  WaveformView.tsx (新组件):
+  - 20 根 reanimated 动画条形，中间高两边低对称分布
+  - withTiming(50ms) 平滑过渡，透明度随高度变化
+  - 轻微正弦抖动模拟自然波形
+
+  SessionScreen 集成:
+  - 录制叠加层嵌入 WaveformView（替代纯文字 "🎙️ Listening..."）
+  - useState(volumeLevel) + useEffect 订阅 audioManager.onVolumeUpdate
+
+  WakeUpManager 集成:
+  - activate(): configureSession() → startRecording()
+  - deactivate(): stopRecording() → stopASR()
+
+TS 编译状态:
+  - 新增错误：0 ✅
+  - 预存 UI 错误不变（HomeScreen/SettingsScreen — feat-10 范围）
+
+下一步:
+  - feat-06: 豆包流式 ASR（PCM 音频 → 豆包 WS API → 中间/最终转录文本）
+  - feat-07: 双路径 TTS + 半双工模式
+
+----------------------------------------
 （后续会话在此追加，格式如下）
 ----------------------------------------
