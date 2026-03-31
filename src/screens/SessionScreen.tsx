@@ -1,12 +1,14 @@
-import React, { useEffect, useRef, useCallback } from 'react';
+import React, { useEffect, useRef, useCallback, useState } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
 import { useSessionStore } from '@/store/useSessionStore';
 import { useAppStore } from '@/store/useAppStore';
 import { ChatLogList } from '@/components/chat/ChatLogList';
 import { StatusIndicator } from '@/components/common/StatusIndicator';
 import CameraPreview from '@/components/camera/CameraPreview';
+import { WaveformView } from '@/components/audio/WaveformView';
 import { wakeUpManager } from '@/services/wake/WakeUpManager';
 import { cameraManager } from '@/services/camera/CameraManager';
+import { audioManager } from '@/services/audio/AudioManager';
 import { IDLE_TIMEOUT_MS, IDLE_WARNING_MS } from '@/utils/constants';
 
 export function SessionScreen({ navigation }: { navigation: any }) {
@@ -23,6 +25,17 @@ export function SessionScreen({ navigation }: { navigation: any }) {
 
   // Track frames received for display
   const receivedFramesRef = useRef(0);
+
+  // Track mic volume for waveform visualization
+  const [volumeLevel, setVolumeLevel] = useState(0);
+
+  // Subscribe to audio manager volume updates
+  useEffect(() => {
+    const unsub = audioManager.onVolumeUpdate((level) => {
+      setVolumeLevel(level);
+    });
+    return unsub;
+  }, []);
 
   const handleFrameReady = useCallback((
     _jpegBase64: string,
@@ -58,12 +71,15 @@ export function SessionScreen({ navigation }: { navigation: any }) {
           onFrameReady={handleFrameReady}
         />
 
-        {/* ASR listening overlay */}
+        {/* ASR listening overlay with waveform */}
         {mode === 'active' && (
           <View style={styles.recordingOverlay}>
             <View style={styles.recordingDot} />
+            <View style={styles.waveformWrapper}>
+              <WaveformView volumeLevel={volumeLevel} barCount={20} />
+            </View>
             <Text style={styles.recordingText}>
-              {currentTranscript ? '🎙️ Listening...' : '🎙️ Ready'}
+              {currentTranscript ? 'Listening...' : 'Ready'}
             </Text>
           </View>
         )}
@@ -156,7 +172,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: 'rgba(0, 0, 0, 0.6)',
     borderRadius: 20,
-    paddingHorizontal: 16,
+    paddingHorizontal: 14,
     paddingVertical: 8,
     gap: 8,
   },
@@ -166,9 +182,12 @@ const styles = StyleSheet.create({
     borderRadius: 5,
     backgroundColor: '#ef4444',
   },
+  waveformWrapper: {
+    width: 120,
+  },
   recordingText: {
     color: '#3b82f6',
-    fontSize: 14,
+    fontSize: 13,
     fontWeight: '600',
   },
   frameCounter: {

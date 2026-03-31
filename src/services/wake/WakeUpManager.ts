@@ -47,6 +47,9 @@ export class WakeUpManager {
       // 2. Configure audio session (simultaneous record + play)
       await audioManager.configureSession();
 
+      // 2b. Start mic recording (for waveform + future PCM streaming)
+      await audioManager.startRecording();
+
       // 3. Initialize camera
       await cameraManager.initialize();
       sessionStore.setIsCameraActive(true);
@@ -107,7 +110,10 @@ export class WakeUpManager {
     this.stopIdleMonitor();
 
     // Graceful shutdown order matters!
-    // 1. Stop ASR first
+    // 1. Stop mic recording first
+    await audioManager.stopRecording();
+
+    // 2. Stop ASR
     await asrService.stopListening();
     useSessionStore.getState().setIsMicActive(false);
 
