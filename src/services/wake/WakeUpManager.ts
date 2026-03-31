@@ -16,6 +16,7 @@ import { gatewayClient } from '@/services/gateway/GatewayClient';
 import { useAppStore } from '@/store/useAppStore';
 import { useSessionStore } from '@/store/useSessionStore';
 import { SecureStorage } from '@/services/storage/SecureStorage';
+import { v4 as uuid } from 'uuid';
 import { getLogger } from '@/utils/logger';
 import { IDLE_TIMEOUT_MS } from '@/utils/constants';
 
@@ -148,7 +149,7 @@ export class WakeUpManager {
       if (reply?.payload) {
         // Add AI response to chat history
         sessionStore.addMessage({
-          id: crypto.randomUUID(),
+          id: uuid(),
           role: 'assistant',
           content: typeof reply.payload === 'string' ? reply.payload : JSON.stringify(reply.payload),
           timestamp: Date.now(),

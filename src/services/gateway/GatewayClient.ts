@@ -3,12 +3,18 @@
  *
  * Handles:
  *  1. TCP/WSS connection lifecycle
- *  2. Challenge → Connect → Hello-OK authentication handshake
+ *  2. Challenge → Connect(+Device Identity) → Hello-OK authentication handshake
  *  3. RPC call encapsulation (req → wait for matching res)
  *  4. Reconnection with exponential backoff + jitter
  *  5. Heartbeat / tick handling
  *
- * Based on: openclaw docs/gateway/protocol.md
+ * Protocol details discovered via integration testing:
+ *  - client.id MUST be a valid GatewayClientId enum value (e.g., 'openclaw-ios')
+ *  - client.mode MUST be a valid GatewayClientMode value (e.g., 'ui')
+ *  - Device identity (Ed25519 keypair + v3 signed payload) is REQUIRED for scopes
+ *  - AI chat uses 'chat.send' RPC (not 'send', which is for channel messages)
+ *
+ * Based on: openclaw source code & integration tests
  */
 
 import { v4 as uuid } from 'uuid';
@@ -46,6 +52,13 @@ interface PendingRequest {
   timeout: ReturnType<typeof setTimeout>;
 }
 
+/** Device identity stored after generation/pairing */
+export interface DeviceIdentity {
+  deviceId: string;       // SHA-256 hex of raw public key
+  publicKeyB64Url: string; // Raw 32-byte Ed25519 public key, base64url-encoded
+  privateKeyPem: string;   // PKCS#8 PEM private key (store securely!)
+}
+
 // ─── GatewayClient ──────────────────────────────────────────────────
 
 export class GatewayClient {
@@ -73,6 +86,9 @@ export class GatewayClient {
   private challengeNonce: string | null = null;
   private helloOkPayload: HelloOkPayload | null = null;
 
+  // Device identity (Ed25519 keypair — generated once, persisted securely)
+  private deviceIdentity: DeviceIdentity | null = null;
+
   get status(): ConnectionStatus {
     return this._status;
   }
@@ -82,8 +98,20 @@ export class GatewayClient {
   }
 
   /**
+   * Set the device identity (call before connect()).
+   * Generated once on first launch and persisted in SecureStorage.
+   */
+  setDeviceIdentity(identity: DeviceIdentity): void {
+    this.deviceIdentity = identity;
+  }
+
+  get hasDeviceIdentity(): boolean {
+    return this.deviceIdentity !== null;
+  }
+
+  /**
    * Connect to an OpenClaw gateway.
-   * Full flow: TCP connect → receive challenge → send connect → receive hello-ok
+   * Full flow: TCP connect → challenge → connect(+device identity) → hello-ok
    */
   async connect(wsUrl: string, authToken: string): Promise<HelloOkPayload> {
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
@@ -102,7 +130,6 @@ export class GatewayClient {
 
         this.ws.onopen = () => {
           log.info('WebSocket connection opened to', wsUrl);
-          // Server will send connect.challenge; we handle it in onmessage
         };
 
         this.ws.onmessage = (event) => {
@@ -110,15 +137,14 @@ export class GatewayClient {
             const frame: GatewayFrame = JSON.parse(typeof event.data === 'string' ? event.data : '');
             this.handleFrame(frame);
 
-            // Resolve connect promise when we receive hello-ok
             if (
               frame.type === 'res' &&
-              (frame as ResponseFrame).payload &&
-              ((frame as ResponseFrame).payload as Record<string, unknown>).type === 'hello-ok'
+              frame.payload &&
+              (frame.payload as Record<string, unknown>).type === 'hello-ok'
             ) {
-              this.helloOkPayload = (frame as ResponseFrame).payload as HelloOkPayload;
+              this.helloOkPayload = frame.payload as HelloOkPayload;
               this.setStatus('connected');
-              this.attempt = 0; // Reset reconnection counter
+              this.attempt = 0;
               this.startHeartbeat();
               resolve(this.helloOkPayload);
             }
@@ -130,14 +156,13 @@ export class GatewayClient {
         this.ws.onclose = (event) => {
           log.info('WebSocket closed', event.code, event.reason);
           this.handleDisconnect(event.code, event.reason);
-          // Reject the connect promise if not yet resolved
           if (this._status === 'connecting') {
             reject(new Error(`Connection closed: ${event.reason} (${event.code})`));
           }
         };
 
-        this.ws.onerror = (event) => {
-          log.error('WebSocket error', event);
+        this.ws.onerror = () => {
+          log.error('WebSocket error');
           this.setStatus('error');
           if (this._status === 'connecting') {
             reject(new Error('WebSocket connection error'));
@@ -149,55 +174,39 @@ export class GatewayClient {
     });
   }
 
-  /**
-   * Handle incoming frames from the gateway
-   */
   private handleFrame(frame: GatewayFrame): void {
     switch (frame.type) {
       case 'event':
         this.handleEvent(frame as EventFrame);
         break;
-
       case 'res':
         this.handleResponse(frame as ResponseFrame);
         break;
-
       default:
         log.warn('Unknown frame type:', (frame as Record<string, unknown>).type);
     }
   }
 
   private handleEvent(event: EventFrame): void {
-    // Handle connect.challenge — server sends this immediately after TCP connect
     if (event.event === 'connect.challenge') {
       const payload = event.payload as ConnectChallengePayload;
       this.challengeNonce = payload.nonce;
       log.info('Received connect challenge, nonce:', payload.nonce?.slice(0, 8) + '...');
-
-      // Auto-respond with connect request
       this.sendConnectRequest();
       return;
     }
 
-    // Dispatch to registered event handlers
     const handlers = this.eventHandlers.get(event.event);
-    if (handlers) {
-      handlers.forEach((handler) => handler(event));
-    }
+    if (handlers) handlers.forEach((handler) => handler(event));
 
-    // Handle tick events (heartbeat)
     if (event.event === 'tick') {
-      // Tick received — connection is alive
       this.lastPongTime = Date.now();
     }
   }
 
   private handleResponse(res: ResponseFrame): void {
     const pending = this.pendingRequests.get(res.id);
-    if (!pending) {
-      log.warn('Received response for unknown request:', res.id);
-      return;
-    }
+    if (!pending) return; // connect response handled in onmessage
 
     clearTimeout(pending.timeout);
     this.pendingRequests.delete(res.id);
@@ -205,16 +214,17 @@ export class GatewayClient {
     if (res.ok) {
       pending.resolve(res.payload);
     } else {
-      pending.reject(
-        new Error(
-          `RPC Error [${res.error?.code}]: ${res.error?.message}`,
-        ),
-      );
+      pending.reject(new Error(`RPC Error [${res.error?.code}]: ${res.error?.message}`));
     }
   }
 
   /**
-   * Send the connect request after receiving challenge
+   * Send the connect request after receiving challenge.
+   * Includes device identity (Ed25519) if available — required for operator.write scope.
+   *
+   * CRITICAL: All values in the connect params MUST exactly match what we sign in the
+   * device auth payload, because the server rebuilds the payload from these params
+   * to verify our signature.
    */
   private sendConnectRequest(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
@@ -222,24 +232,31 @@ export class GatewayClient {
       return;
     }
 
-    const connectParams: ConnectParams = {
+    // Build client info — values here are also used in device auth payload signature
+    const clientInfo = {
+      id: 'openclaw-ios' as const,       // Must be valid GatewayClientId enum
+      displayName: 'MobileClaw',
+      version: '1.0.0',
+      platform: 'ios',
+      mode: 'ui' as const,             // Must be valid GatewayClientMode enum
+      deviceFamily: 'iPhone',         // Must match what's signed in device payload!
+    };
+
+    const connectParams: ConnectParams & Record<string, unknown> = {
       minProtocol: PROTOCOL_VERSION,
       maxProtocol: PROTOCOL_VERSION,
-      client: {
-        id: 'mobileclaw-ios',
-        displayName: 'MobileClaw',
-        version: '1.0.0',
-        platform: 'ios',
-        mode: 'operator',
-      },
+      client: clientInfo,
       role: 'operator',
       scopes: ['operator.read', 'operator.write'],
-      auth: {
-        token: this.token,
-      },
+      auth: { token: this.token },
       locale: 'zh-CN',
-      userAgent: `mobileclaw/${'1.0.0'}`,
+      userAgent: 'mobileclaw/1.0.0',
     };
+
+    // If we have device identity, attach it (required for scoped access)
+    if (this.deviceIdentity && this.challengeNonce) {
+      connectParams.device = this.buildDeviceAuthObject(clientInfo);
+    }
 
     const frame: RequestFrame = {
       type: 'req',
@@ -248,12 +265,40 @@ export class GatewayClient {
       params: connectParams,
     };
 
-    log.info('Sending connect request...');
+    log.info('Sending connect request...',
+      this.deviceIdentity ? '(with device identity)' : '(WARNING: no device identity — scopes will be empty)');
     this.sendRaw(JSON.stringify(frame));
   }
 
   /**
-   * Make an RPC call — sends a req frame and waits for matching res frame
+   * Build the device object for the connect request.
+   * This requires native Ed25519 crypto (see DeviceIdentityService).
+   * For now, this is a placeholder that returns null until the native module is ready.
+   * The test script (scripts/test-gateway-connection.mjs) proves the full flow works.
+   */
+  private buildDeviceAuthObject(clientInfo: { platform: string; deviceFamily: string }): Record<string, unknown> | null {
+    if (!this.deviceIdentity || !this.challengeNonce) return null;
+
+    // TODO: When native Ed25519 module is available:
+    // 1. Build v3 auth payload string from connect params + challenge nonce
+    // 2. Sign it with deviceIdentity.privateKeyPem using Ed25519
+    // 3. Return { id, publicKey, signature, signedAt, nonce }
+    //
+    // Payload format (MUST match server's buildDeviceAuthPayloadV3 exactly):
+    //   "v3|{deviceId}|{clientId}|{clientMode}|{role}|{scopes}|{signedAtMs}|{token}|{nonce}|{platform_norm}|{deviceFamily_norm}"
+    //
+    // Platform/deviceFamily normalization: trim + ASCII lowercase only
+    //
+    // See scripts/test-gateway-connection.mjs for working reference implementation
+
+    log.warn('Device identity present but Ed25519 signing not yet implemented in RN context');
+    log.warn('Falling back to unauthenticated connect (scopes will be empty)');
+    return null;
+  }
+
+  /**
+   * Make an RPC call — sends a req frame and waits for matching res frame.
+   * Use chat.send for AI conversation (not 'send' which is for channel messages).
    */
   async rpc<T = unknown>(method: string, params?: unknown): Promise<T> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
@@ -276,8 +321,18 @@ export class GatewayClient {
   }
 
   /**
-   * Send a raw string over the WebSocket
+   * Send a message to the AI agent via chat.send RPC.
+   * Convenience wrapper around rpc('chat.send', ...).
    */
+  async chatSend(message: string, options?: { sessionKey?: string; attachments?: Array<Record<string, unknown>> }): Promise<unknown> {
+    return this.rpc('chat.send', {
+      sessionKey: options?.sessionKey ?? 'main:webchat:mobileclaw',
+      message,
+      idempotencyKey: `mobileclaw-${Date.now()}-${uuid().slice(0, 8)}`,
+      ...(options?.attachments ? { attachments: options.attachments } : {}),
+    });
+  }
+
   private sendRaw(data: string): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(data);
@@ -286,20 +341,9 @@ export class GatewayClient {
     }
   }
 
-  /**
-   * Send an event frame (e.g., video_frame for real-time streaming)
-   */
   sendEvent(eventName: string, payload?: unknown): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      log.warn('Cannot send event: WebSocket not open');
-      return;
-    }
-
-    const frame: EventFrame = {
-      type: 'event',
-      event: eventName,
-      payload,
-    };
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const frame: EventFrame = { type: 'event', event: eventName, payload };
     this.sendRaw(JSON.stringify(frame));
   }
 
@@ -313,17 +357,11 @@ export class GatewayClient {
 
     this.heartbeatInterval = setInterval(() => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-
-      // Check if we've received a recent tick/pong
       if (Date.now() - this.lastPongTime > HEARTBEAT_INTERVAL_MS * 2) {
         log.warn('No heartbeat response for 30s, closing connection');
         this.ws.close(4001, 'heartbeat_timeout');
         return;
       }
-
-      // The tick is handled by the server; we just need to monitor it
-      // If using a custom ping, uncomment below:
-      // this.sendRaw(JSON.stringify({ type: 'ping', ts: Date.now() }));
     }, HEARTBEAT_INTERVAL_MS);
   }
 
@@ -336,18 +374,13 @@ export class GatewayClient {
 
   private handleDisconnect(code: number, reason: string): void {
     this.stopHeartbeat();
-
-    // Reject all pending requests
     for (const [id, pending] of this.pendingRequests) {
       clearTimeout(pending.timeout);
       pending.reject(new Error(`Connection closed: ${reason}`));
     }
     this.pendingRequests.clear();
-
-    // Notify disconnect listeners
     this.disconnectListeners.forEach((handler) => handler(code, reason));
 
-    // Don't reconnect on normal closure
     if (code === 1000 || code === 1001) {
       this.setStatus('disconnected');
       return;
@@ -360,23 +393,18 @@ export class GatewayClient {
     if (this.attempt >= RECONNECT_MAX_ATTEMPTS) {
       log.error('Max reconnection attempts reached');
       this.setStatus('error');
-      this.disconnectListeners.forEach((handler) =>
-        handler(-1, 'Max reconnect attempts reached'),
-      );
+      this.disconnectListeners.forEach((handler) => handler(-1, 'Max reconnect attempts reached'));
       return;
     }
 
-    // Exponential backoff with jitter
     const delay = Math.min(
       RECONNECT_BASE_DELAY_MS * Math.pow(2, this.attempt),
       RECONNECT_MAX_DELAY_MS,
-    ) * (0.5 + Math.random() * 0.5); // ±50% jitter
+    ) * (0.5 + Math.random() * 0.5);
 
     this.attempt++;
     this.setStatus('reconnecting');
-    log.info(
-      `Reconnecting in ${Math.round(delay)}ms (attempt ${this.attempt}/${RECONNECT_MAX_ATTEMPTS})`,
-    );
+    log.info(`Reconnecting in ${Math.round(delay)}ms (attempt ${this.attempt}/${RECONNECT_MAX_ATTEMPTS})`);
 
     this.reconnectTimer = setTimeout(() => {
       if (this.url && this.token) {
@@ -405,25 +433,20 @@ export class GatewayClient {
   }
 
   onEvent(eventName: string, handler: FrameHandler): () => void {
-    if (!this.eventHandlers.has(eventName)) {
-      this.eventHandlers.set(eventName, new Set());
-    }
+    if (!this.eventHandlers.has(eventName)) this.eventHandlers.set(eventName, new Set());
     this.eventHandlers.get(eventName)!.add(handler);
     return () => this.eventHandlers.get(eventName)?.delete(handler);
   }
 
   // ─── Lifecycle ──────────────────────────────────────────────────
 
-  /**
-   * Graceful disconnect
-   */
   disconnect(): void {
     this.stopHeartbeat();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    this.attempt = RECONNECT_MAX_ATTEMPTS; // Prevent auto-reconnect
+    this.attempt = RECONNECT_MAX_ATTEMPTS;
 
     if (this.ws) {
       this.ws.close(1000, 'Client disconnect');
@@ -435,9 +458,6 @@ export class GatewayClient {
     this.challengeNonce = null;
   }
 
-  /**
-   * Clean up all resources
-   */
   destroy(): void {
     this.disconnect();
     this.statusListeners.clear();

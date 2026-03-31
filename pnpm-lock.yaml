@@ -60,6 +60,9 @@ importers:
       typescript:
         specifier: ~5.9.2
         version: 5.9.3
+      ws:
+        specifier: ^8.20.0
+        version: 8.20.0
 
 packages:
 

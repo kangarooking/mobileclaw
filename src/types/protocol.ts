@@ -127,11 +127,28 @@ export interface HelloOkPayload {
 
 // ─── RPC Method Payloads (commonly used) ─────────────────────────────
 
-/** send — Send a message to the agent */
+/** send — Send a channel message (WhatsApp/SMS/etc., NOT for AI chat) */
 export interface SendParams {
+  to: string;              // Recipient (phone number, etc.)
+  channel: string;          // Channel name (whatsapp, sms, etc.)
   message: string;
-  image?: string;        // base64 JPEG
-  sessionKey?: string;
+  idempotencyKey: string;   // Deduplication key
+}
+
+/** chat.send — Send a message to the AI agent (the correct method for conversation) */
+export interface ChatSendParams {
+  sessionKey: string;       // Format: "agentId:channel:peer" (e.g., "main:webchat:mobileclaw")
+  message: string;
+  idempotencyKey: string;   // Deduplication key
+  thinking?: string;        // Optional thinking instruction
+  deliver?: boolean;         // Auto-deliver to channel
+  attachments?: Array<{     // Optional image/file attachments
+    type?: string;
+    mimeType?: string;
+    fileName?: string;
+    content?: unknown;      // base64 data
+  }>;
+  timeoutMs?: number;        // RPC timeout override
 }
 
 /** tts.convert — Convert text to speech */

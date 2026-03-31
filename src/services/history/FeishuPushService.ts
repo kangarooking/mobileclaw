@@ -7,6 +7,7 @@
 
 import type { ChatMessage } from '@/types/session';
 import type { FeishuConfig } from '@/types/config';
+import { useAppStore } from '@/store/useAppStore';
 import { getLogger } from '@/utils/logger';
 
 const log = getLogger('FeishuPush');
@@ -172,12 +173,4 @@ export class FeishuPushService {
       ],
     };
   }
-}
-
-// Need access to store — import at bottom to avoid circular dependency
-// We'll inline the config access in methods above
-function useAppStore() {
-  // Dynamic import to avoid circular deps at module load time
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  return require('@/store/useAppStore').useAppStore();
 }
