@@ -1,6 +1,1 @@
-{
-  "extends": "expo/tsconfig.base",
-  "compilerOptions": {
-    "strict": true
-  }
-}
+{"extends": "expo/tsconfig.base", "compilerOptions": {"strict": true, "baseUrl": ".", "paths": {"@/*": ["src/*"]}}, "include": ["src/**/*", "__tests__/**/*", "index.ts", "App.tsx"], "exclude": ["node_modules", "ios", "android"]}
