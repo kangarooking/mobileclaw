@@ -182,6 +182,17 @@ test('Audio pipeline complete', () => {
   const asr = readFileSync(join(SRC, 'services/audio/ASRService.ts'), 'utf-8');
   if (!asr.includes('feedPCM')) throw new Error('ASRService missing feedPCM');
 
+  // Verify ASR provider uses proper credentials (not placeholder apiKey)
+  const doubaoAsr = readFileSync(join(SRC, 'services/audio/providers/DoubaoASRProvider.ts'), 'utf-8');
+  if (!doubaoAsr.includes('appId')) throw new Error('DoubaoASRProvider missing appId credential field');
+  if (!doubaoAsr.includes('accessToken')) throw new Error('DoubaoASRProvider missing accessToken credential field');
+  if (!doubaoAsr.includes('appid')) throw new Error('DoubaoASRProvider missing appid in config payload');
+
+  // Verify SecureStorage has ASR credential methods
+  const ss = readFileSync(join(SRC, 'services/storage/SecureStorage.ts'), 'utf-8');
+  if (!ss.includes('setASRAppId')) throw new Error('SecureStorage missing setASRAppId');
+  if (!ss.includes('getASRAccessToken')) throw new Error('SecureStorage missing getASRAccessToken');
+
   const tts = readFileSync(join(SRC, 'services/audio/TTSService.ts'), 'utf-8');
   if (!tts.includes('speak')) throw new Error('TTSService missing speak');
   if (!tts.includes('isTTSSpeaking')) throw new Error('TTSService missing half-duplex');

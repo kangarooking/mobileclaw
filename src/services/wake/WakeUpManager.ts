@@ -83,8 +83,16 @@ export class WakeUpManager {
       // Strategy B: Start continuous video_frame event stream (5fps default)
       frameSender.startContinuousStream();
 
-      // 7. Start ASR
-      const asrConfig = appStore.config.asr;
+      // 7. Start ASR (load credentials from secure storage)
+      const asrConfig = { ...appStore.config.asr };
+      if (asrConfig.type === 'doubao') {
+        const [appId, accessToken] = await Promise.all([
+          SecureStorage.getASRAppId(),
+          SecureStorage.getASRAccessToken(),
+        ]);
+        if (appId) asrConfig.appId = appId;
+        if (accessToken) asrConfig.accessToken = accessToken;
+      }
       await asrService.initialize(asrConfig);
       await asrService.startListening({
         onInterim: (text) => {

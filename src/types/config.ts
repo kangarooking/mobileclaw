@@ -20,7 +20,12 @@ export type ASRProviderType = 'doubao' | 'custom';
 
 export interface ASRProviderConfig {
   type: ASRProviderType;
-  apiKey?: string;                 // Stored in SecureStorage
+  /** 豆包 AppID（火山引擎控制台创建应用获得） */
+  appId?: string;                  // Stored in SecureStorage
+  /** 豆包 Access Token */
+  accessToken?: string;            // Stored in SecureStorage
+  /** 豆包 Secret Key（用于签名，部分模式需要） */
+  secretKey?: string;             // Stored in SecureStorage
   endpoint?: string;               // Custom endpoint URL
   language: string;                // e.g., 'zh-CN', 'en-US'
   model?: string;
@@ -33,7 +38,9 @@ export type TTSProviderType = 'openclaw' | 'edge' | 'doubao' | 'custom';
 
 export interface TTSProviderConfig {
   type: TTSProviderType;
-  apiKey?: string;                 // Stored in SecureStorage
+  apiKey?: string;                 // Stored in SecureStorage (legacy / non-Doubao providers)
+  appId?: string;                 // Volcengine App ID (Doubao TTS)
+  accessToken?: string;           // Volcengine Access Token (Doubao TTS)
   endpoint?: string;
   voiceId?: string;
   language: string;

@@ -9,6 +9,28 @@ export function SettingsScreen() {
   const [newGwUrl, setNewGwUrl] = useState('');
   const [newGwToken, setNewGwToken] = useState('');
 
+  // ASR credential fields
+  const [asrAppId, setAsrAppId] = useState('');
+  const [asrAccessToken, setAsrAccessToken] = useState('');
+
+  /** Save ASR credentials to SecureStorage and update config */
+  const handleSaveASRCredentials = async () => {
+    if (asrAppId.trim()) {
+      await SecureStorage.setASRAppId(asrAppId.trim());
+    }
+    if (asrAccessToken.trim()) {
+      await SecureStorage.setASRAccessToken(asrAccessToken.trim());
+    }
+    // Update config reference so WakeUpManager can read them
+    updateConfig({
+      asr: {
+        ...config.asr,
+        appId: asrAppId.trim() || undefined,
+        accessToken: asrAccessToken.trim() || undefined,
+      },
+    });
+  };
+
   const handleAddGateway = async () => {
     if (!newGwName.trim() || !newGwUrl.trim()) return;
 
@@ -99,6 +121,37 @@ export function SettingsScreen() {
             <Text style={styles.settingValue}>{config.tts.type}</Text>
           </View>
         </View>
+
+        {/* ─── Doubao ASR Credentials ─── */}
+        {config.asr.type === 'doubao' && (
+          <>
+            <Text style={styles.sectionTitle}>豆包 ASR 凭证（火山引擎）</Text>
+            <View style={styles.addForm}>
+              <TextInput
+                placeholder="App ID (如 7628583300)"
+                placeholderTextColor="#555"
+                value={asrAppId}
+                onChangeText={setAsrAppId}
+                autoCapitalize="none"
+                autoCorrect={false}
+                style={styles.input}
+              />
+              <TextInput
+                placeholder="Access Token"
+                placeholderTextColor="#555"
+                value={asrAccessToken}
+                onChangeText={setAsrAccessToken}
+                secureTextEntry
+                autoCapitalize="none"
+                autoCorrect={false}
+                style={styles.input}
+              />
+              <TouchableOpacity onPress={handleSaveASRCredentials} style={[styles.addButton, { backgroundColor: '#3b82f6' }]}>
+                <Text style={styles.addButtonText}>保存 ASR 凭证</Text>
+              </TouchableOpacity>
+            </View>
+          </>
+        )}
 
         {/* ─── Video Settings ─── */}
         <Text style={styles.sectionTitle}>视频设置</Text>

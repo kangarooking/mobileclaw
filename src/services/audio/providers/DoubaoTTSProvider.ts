@@ -36,8 +36,9 @@ export class DoubaoTTSProvider implements TTSProvider {
    */
   async speak(text: string, handlers?: TTSEventHandlers): Promise<void> {
     if (!text.trim()) return;
-    if (!this.config?.apiKey) {
-      handlers?.onError?.(new Error('Doubao TTS API key not configured'));
+    const hasCredentials = this.config?.appId && this.config?.accessToken;
+    if (!hasCredentials && !this.config?.apiKey) {
+      handlers?.onError?.(new Error('Doubao TTS credentials not configured (need App ID + Access Token)'));
       return;
     }
 
@@ -80,18 +81,20 @@ export class DoubaoTTSProvider implements TTSProvider {
 
   private async synthesize(text: string): Promise<ArrayBuffer | null> {
     const endpoint = this.config?.endpoint || DEFAULT_ENDPOINT;
+    // Use dedicated Doubao credentials, fallback to generic apiKey
+    const appId = this.config?.appId || this.config?.apiKey || '';
+    const token = this.config?.accessToken || this.config?.options?.['token' as string] || this.config?.apiKey || '';
 
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer; ${this.config!.apiKey}`,
         },
         body: JSON.stringify({
           app: {
-            appid: this.config!.apiKey,
-            token: this.config!.options?.['token'] || this.config!.apiKey,
+            appid: appId,
+            token: token,
             cluster: 'volcengine_streaming_common',
           },
           user: {

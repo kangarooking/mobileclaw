@@ -66,15 +66,29 @@ export class SecureStorage {
     return this.getItem(`gw_${gatewayId}_token`);
   }
 
-  // ─── API Key Methods ─────────────────────────────────────────────
+  // ─── Doubao ASR Credentials ──────────────────────────────────────
 
-  static async setASRApiKey(key: string): Promise<void> {
-    return this.setItem('asr_api_key', key);
+  /** Store Volcengine App ID */
+  static async setASRAppId(appId: string): Promise<void> {
+    return this.setItem('asr_app_id', appId);
   }
 
-  static async getASRApiKey(): Promise<string | null> {
-    return this.getItem('asr_api_key');
+  /** Retrieve Volcengine App ID */
+  static async getASRAppId(): Promise<string | null> {
+    return this.getItem('asr_app_id');
   }
+
+  /** Store Volcengine Access Token */
+  static async setASRAccessToken(token: string): Promise<void> {
+    return this.setItem('asr_access_token', token);
+  }
+
+  /** Retrieve Volcengine Access Token */
+  static async getASRAccessToken(): Promise<string | null> {
+    return this.getItem('asr_access_token');
+  }
+
+  // ─── TTS API Key Methods ────────────────────────────────────────────
 
   static async setTTSApiKey(key: string): Promise<void> {
     return this.setItem('tts_api_key', key);
