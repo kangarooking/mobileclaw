@@ -1,24 +1,16 @@
 /**
- * DoubaoASRProvider — 豆包/火山引擎流式语音识别
+ * DoubaoASRProvider - Volcengine/Doubao streaming speech recognition
  *
- * 基于 Volcengine Speech Recognition WebSocket API (v1)。
- * 协议参考: https://www.volcengine.com/docs/6561/80823
- * SDK 参考: @xmov/doubao-asr（提取了协议帧格式和事件模型）
+ * Official binary protocol (v3):
+ *   - Auth via HTTP headers: X-Api-App-Key, X-Api-Access-Key, X-Api-Resource-Id
+ *   - Binary frames: 4B header + 4B seq/size + gzip payload
+ *   - Endpoint: wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async *
+ * RN Note: Built-in WebSocket does not support custom HTTP headers on upgrade.
+ *          For production, replace with a native WS module (e.g. ThermalWS)
+ *          or bridge to platform-native Volcengine SDK.
+ *          This impl passes credentials via query params as fallback.
  *
- * 认证方式:
- *   - AppId + Access Token（火山引擎控制台获取）
- *   - 发送在 full_client_config 帧的 app 字段中
- *
- * 音频输入:
- *   - 外部 PCM 数据通过 feedPCM() 注入（来自 AudioManager/AudioCaptureBridge）
- *   - 格式: 16kHz / mono / 16bit PCM
- *
- * 协议流程:
- *   1. WS connect → wss://openspeech.bytedance.com/api/v1/asr
- *   2. Send full_client_config (JSON, 含 appid+token)
- *   3. Stream audio_data (binary PCM)
- *   4. Receive partial_result / final_result / speech_finished
- *   5. Send audio_finish → close
+ * Reference: sauc_websocket_demo.py (official Python demo)
  */
 
 import type { ASRProvider, ASREventHandlers } from '../ASRService';
@@ -26,440 +18,351 @@ import type { ASRProviderConfig } from '@/types/config';
 import { getLogger } from '@/utils/logger';
 import { AUDIO_SAMPLE_RATE } from '@/utils/constants';
 import { v4 as uuid } from 'uuid';
+// pako has no @types package — suppress import type error
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { gzip, ungzip } = require('pako') as { gzip: (d: Uint8Array) => Uint8Array; ungzip: (d: Uint8Array) => Uint8Array };
 
 const log = getLogger('DoubaoASR');
 
-// ─── Protocol Constants ─────────────────────────────────────────────
+const DEFAULT_ENDPOINT = 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async';
+const DEFAULT_RESOURCE_ID = 'volc.bigasr.sauc.duration';
 
-/** Volcengine ASR v1 endpoint */
-const DEFAULT_ENDPOINT = 'wss://openspeech.bytedance.com/api/v1/asr';
+// Message types (upper nibble of byte 1)
+const MT_CLIENT_FULL  = 0x10;
+const MT_CLIENT_AUDIO = 0x20;
+const MT_SERVER_FULL  = 0x90;
+const MT_SERVER_ERR   = 0xF0;
 
-/** Payload types sent to server */
-const PAYLOAD_TYPE = {
-  CONFIG: 'full_client_config',
-  AUDIO: 'audio_data',
-  FINISH: 'audio_finish',
-} as const;
+// Flags (lower nibble of byte 1)
+const F_NO_SEQ     = 0x00;
+const F_POS_SEQ    = 0x01;
+const F_NEG_SEQ    = 0x02;
+const F_NEG_WSEQ   = 0x03;
 
-/** Result types received from server */
-const RESULT_TYPE = {
-  INTERIM: 'partial_result',
-  FINAL: 'final_result',
-  ERROR: 'error',
-  FINISHED: 'speech_finished',
-} as const;
-
-// ─── Types ──────────────────────────────────────────────────────────
-
-interface DoubaoConfigPayload {
-  app: {
-    appid: string;
-    token: string;
-    cluster?: string;
-  };
-  user: {
-    uid: string;
-  };
-  audio: {
-    format: string;
-    rate: number;
-    channel: number;
-    bits: number;
-    language: string;
-  };
-  request: {
-    reqid: string;
-    nbest: number;
-    result_type: 'full' | 'partial';
+interface ServerResp {
+  msgType: number;
+  isLast: boolean;
+  errorCode?: number | null;
+  json?: {
+    result?: {
+      text?: string;
+      utterances?: Array<{ text: string; definite?: boolean }>;
+    };
+    error_code?: number;
+    error_message?: string;
   };
 }
 
-interface DoubaoResultPayload {
-  type: string;
-  seq: number;
-  result?: {
-    text: string;
-    confidence: number;
-    is_final?: boolean;
-  };
-  error_code?: number;
-  error_message?: string;
+// ─── Uint8Array Helpers (RN-compatible Buffer replacement) ────────
+
+function u8alloc(n: number): Uint8Array {
+  return new Uint8Array(n);
 }
 
-// ─── Provider Implementation ─────────────────────────────────────────
+function writeU32BE(buf: Uint8Array, offset: number, val: number): void {
+  buf[offset]     = (val >>> 24) & 0xff;
+  buf[offset + 1] = (val >>> 16) & 0xff;
+  buf[offset + 2] = (val >>> 8) & 0xff;
+  buf[offset + 3] = val & 0xff;
+}
+
+function readU32BE(buf: Uint8Array, offset: number): number {
+  return ((buf[offset] & 0xff) << 24) |
+         ((buf[offset + 1] & 0xff) << 16) |
+         ((buf[offset + 2] & 0xff) << 8) |
+         (buf[offset + 3] & 0xff);
+}
+
+function readI32BE(buf: Uint8Array, offset: number): number {
+  const v = readU32BE(buf, offset);
+  return v | 0; // convert to signed int32
+}
+
+function concat(...parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((s, p) => s + p.length, 0);
+  const result = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) {
+    result.set(p, off);
+    off += p.length;
+  }
+  return result;
+}
+
+function toU8(data: ArrayBuffer | Uint8Array): Uint8Array {
+  if (data instanceof Uint8Array) return data;
+  return new Uint8Array(data);
+}
+
+// ─── Binary Protocol ───────────────────────────────────────────────
+
+function buildHeader(msgType: number, flags: number): Uint8Array {
+  const b = u8alloc(4);
+  b[0] = 0x11; // version=1, header_size=1
+  b[1] = (msgType << 4) | flags;
+  b[2] = 0x11; // json serialization + gzip compression
+  b[3] = 0x00;
+  return b;
+}
+
+function buildConfigFrame(payload: object, seq: number): Uint8Array {
+  const jsonBytes = new TextEncoder().encode(JSON.stringify(payload));
+  const compressed = gzip(jsonBytes);
+  const hdr = buildHeader(MT_CLIENT_FULL, F_POS_SEQ);
+  const seqBuf = u8alloc(4); writeU32BE(seqBuf, 0, seq);
+  const szBuf = u8alloc(4); writeU32BE(szBuf, 0, compressed.length);
+  return concat(hdr, seqBuf, szBuf, compressed);
+}
+
+function buildAudioFrame(data: ArrayBuffer | Uint8Array, seq: number, isLast: boolean): Uint8Array {
+  const input = toU8(data);
+  const compressed = gzip(input);
+  const flags = isLast ? F_NEG_WSEQ : F_POS_SEQ;
+  const actualSeq = isLast ? -seq : seq;
+  const hdr = buildHeader(MT_CLIENT_AUDIO, flags);
+  const seqBuf = u8alloc(4); writeU32BE(seqBuf, 0, actualSeq);
+  const szBuf = u8alloc(4); writeU32BE(szBuf, 0, compressed.length);
+  return concat(hdr, seqBuf, szBuf, compressed);
+}
+
+function parseResponse(raw: ArrayBuffer | Uint8Array): ServerResp | null {
+  const b = toU8(raw);
+  if (b.length < 5) return null;
+
+  const hdrSize = (b[0] & 0x0f);
+  const msgType = (b[1] >> 4) & 0x0f;
+  const flags = b[1] & 0x0f;
+  const serial = (b[2] >> 4) & 0x0f;
+  const compress = b[2] & 0x0f;
+  let off = hdrSize * 4;
+  const isLast = (flags & 0x02) !== 0;
+
+  let respSeq: number | null = null;
+  if ((flags & 0x01) !== 0 && off + 4 <= b.length) {
+    respSeq = readI32BE(b, off); off += 4;
+  }
+
+  let errCode: number | null = null;
+  let paySz = 0;
+
+  if (msgType === MT_SERVER_FULL && off + 4 <= b.length) {
+    paySz = readU32BE(b, off); off += 4;
+  } else if (msgType === MT_SERVER_ERR && off + 8 <= b.length) {
+    errCode = readI32BE(b, off); off += 4;
+    paySz = readU32BE(b, off); off += 4;
+  }
+
+  let payload = b.slice(off);
+  if (compress === 1 && payload.length > 0) {
+    try { payload = new Uint8Array(ungzip(payload)); } catch { return null; }
+  }
+
+  let json: ServerResp['json'] | undefined;
+  if (serial === 1 && payload.length > 0) {
+    try { json = JSON.parse(new TextDecoder().decode(payload)) as ServerResp['json']; } catch { /* ignore */ }
+  }
+
+  return { msgType, isLast, json, errorCode: errCode };
+}
+
+// ─── Provider ──────────────────────────────────────────────────────
 
 export class DoubaoASRProvider implements ASRProvider {
   private ws: WebSocket | null = null;
-  private config: ASRProviderConfig | null = null;
+  private cfg: ASRProviderConfig | null = null;
   private handlers: ASREventHandlers | null = null;
-  private seq = 0;
-  private connected = false;
+  private seq = 1;
   private finished = false;
+  private interimText = '';
+  private doneUtterances: string[] = [];
+  private reconnects = 0;
+  private maxReconnects = 3;
+  private rcTimer: ReturnType<typeof setTimeout> | null = null;
+  private connected = false;
 
-  /** Accumulated final text for this utterance */
-  private currentUtterance = '';
-
-  /** All completed utterances (for full transcript) */
-  private completedUtterances: string[] = [];
-
-  /** Reconnection state */
-  private reconnectAttempts = 0;
-  private maxReconnectAttempts = 3;
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-
-  /** Heartbeat timer */
-  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-
-  async initialize(config: ASRProviderConfig): Promise<void> {
-    this.config = config;
-    log.info('DoubaoASR initialized:', {
-      endpoint: config.endpoint || DEFAULT_ENDPOINT,
-      appId: config.appId ? `${config.appId.slice(0,4)}...` : '(not set)',
-      language: config.language,
+  async initialize(cfg: ASRProviderConfig): Promise<void> {
+    this.cfg = cfg;
+    log.info('DoubaoASR init (v3 binary protocol)', {
+      endpoint: cfg.endpoint || DEFAULT_ENDPOINT,
+      appId: cfg.appId?.slice(0, 4),
+      resource: (cfg.options?.['resourceId'] as string) || DEFAULT_RESOURCE_ID,
     });
   }
 
-  /**
-   * Start listening — opens WS connection, sends config, begins receiving results.
-   * Call feedPCM() repeatedly to stream audio data.
-   */
-  async startListening(handlers: ASREventHandlers): Promise<void> {
-    if (!this.config?.appId || !this.config?.accessToken) {
-      handlers.onError(new Error(
-        'Doubao ASR credentials not configured. Set App ID and Access Token in Settings.',
-      ));
+  async startListening(h: ASREventHandlers): Promise<void> {
+    if (!this.cfg?.appId || !this.cfg?.accessToken) {
+      h.onError(new Error('Missing App ID or Access Token'));
       return;
     }
-
-    this.handlers = handlers;
-    this.seq = 0;
-    this.currentUtterance = '';
-    this.completedUtterances = [];
+    this.handlers = h;
+    this.seq = 1;
+    this.interimText = '';
+    this.doneUtterances = [];
     this.finished = false;
-    this.reconnectAttempts = 0;
+    this.reconnects = 0;
 
-    const endpoint = this.config.endpoint || DEFAULT_ENDPOINT;
-    log.info('Connecting to Doubao ASR:', endpoint);
+    const ep = this.cfg.endpoint || DEFAULT_ENDPOINT;
+    const rid = (this.cfg.options?.['resourceId'] as string) || DEFAULT_RESOURCE_ID;
+    const cid = uuid();
 
+    log.info('Connecting...', ep);
     try {
-      await this.connect(endpoint);
+      await this.connect(ep, rid, cid);
       this.sendConfig();
-      this.startHeartbeat();
-      log.info('Doubao ASR connected and configured, ready for audio');
-    } catch (error) {
-      log.error('Doubao ASR connection failed:', error);
-      handlers.onError(error instanceof Error ? error : new Error(String(error)));
+      log.info('Ready for PCM audio');
+    } catch (e) {
+      log.error('Connect failed:', e);
+      h.onError(e instanceof Error ? e : new Error(String(e)));
     }
   }
 
-  /**
-   * Feed PCM audio data to the ASR engine.
-   * Call this repeatedly with small chunks (~20ms = 640 bytes at 16kHz/16bit/mono).
-   *
-   * @param pcmData Raw PCM Int16 audio data (ArrayBuffer or Uint8Array)
-   */
-  feedPCM(pcmData: ArrayBuffer | Uint8Array): void {
+  feedPCM(data: ArrayBuffer | Uint8Array): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.finished) return;
-
     try {
-      // Send raw binary PCM data wrapped in a minimal frame envelope
-      // Format: JSON header newline + binary PCM data
-      const header = new TextEncoder().encode(
-        JSON.stringify({ type: PAYLOAD_TYPE.AUDIO, seq: ++this.seq }),
-      );
-      const newline = new TextEncoder().encode('\n');
-      const payload = new Uint8Array(header.length + pcmData.byteLength + newline.length);
-      payload.set(header, 0);
-      payload.set(new Uint8Array(pcmData), header.length);
-      payload.set(newline, header.length + pcmData.byteLength);
-
-      this.ws.send(payload);
-    } catch (err) {
-      log.warn('Failed to send PCM chunk:', err);
-    }
+      this.ws.send(buildAudioFrame(data, this.seq++, false));
+    } catch (e) { log.warn('send PCM failed:', e); }
   }
 
-  /**
-   * Stop listening — send finish signal, wait for final result, close connection.
-   */
   async stopListening(): Promise<void> {
     if (!this.ws) return;
-
     this.finished = true;
-    this.stopHeartbeat();
-    log.info('Sending audio_finish signal');
-
+    log.info('Sending finish...');
     try {
       if (this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({
-          type: PAYLOAD_TYPE.FINISH,
-          seq: ++this.seq,
-        }));
-        // Wait briefly for server to send final result
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        this.ws.send(buildAudioFrame(new Uint8Array(0), this.seq, true));
+        await new Promise((r) => setTimeout(r, 1500));
       }
-    } catch {
-      // Ignore errors during cleanup
-    }
-
+    } catch { /* ignore */ }
     this.close();
-    log.info('Doubao ASR stopped. Utterances:', this.completedUtterances.length);
+    log.info('Stopped. Utterances:', this.doneUtterances.length);
   }
 
-  async destroy(): Promise<void> {
-    await this.stopListening();
+  async destroy(): Promise<void> { await this.stopListening(); }
+
+  // ─── Internal ───────────────────────────────────────────────────
+
+  private buildAuthUrl(ep: string, rid: string, cid: string): string {
+    // RN WebSocket does not support custom HTTP headers on upgrade.
+    // Pass credentials as query parameters as fallback.
+    // Production: swap to native WS module (ThermalWS / platform SDK).
+    const url = new URL(ep);
+    url.searchParams.set('appkey', this.cfg!.appId!);
+    url.searchParams.set('access_token', this.cfg!.accessToken!);
+    url.searchParams.set('resource_id', rid);
+    url.searchParams.set('connect_id', cid);
+    url.searchParams.set('request_id', cid);
+    return url.toString();
   }
 
-  // ─── Internal: Connection & Protocol ──────────────────────────────
+  private async connect(ep: string, rid: string, cid: string): Promise<void> {
+    const url = this.buildAuthUrl(ep, rid, cid);
 
-  private async connect(endpoint: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.ws = new WebSocket(endpoint);
+      this.ws = new WebSocket(url);
 
       this.ws.onopen = () => {
         this.connected = true;
-        log.info('WebSocket connected to ASR endpoint');
         resolve(undefined);
       };
 
-      this.ws.onmessage = (event) => {
-        this.handleMessage(event.data);
+      this.ws.onmessage = (ev: MessageEvent) => {
+        const d = ev.data instanceof ArrayBuffer
+          ? ev.data
+          : typeof ev.data === 'string'
+            ? new TextEncoder().encode(ev.data).buffer
+            : ev.data;
+        this.onMessage(new Uint8Array(d as ArrayBuffer));
       };
 
-      this.ws.onerror = (_event) => {
-        log.error('WebSocket error');
-        reject(new Error('Doubao ASR WebSocket connection error'));
-      };
+      this.ws.onerror = () => reject(new Error('WS error'));
 
-      this.ws.onclose = (event) => {
+      this.ws.onclose = () => {
         this.connected = false;
-        log.info('WebSocket closed:', event.code, event.reason);
-
-        // Auto-reconnect if not intentionally stopping
-        if (!this.finished && this.reconnectAttempts < this.maxReconnectAttempts) {
-          this.attemptReconnect();
+        if (!this.finished && this.reconnects < this.maxReconnects) {
+          this.reconnect(ep, rid, cid);
         }
       };
     });
   }
 
   private sendConfig(): void {
-    if (!this.ws || !this.config) return;
-
-    const payload: DoubaoConfigPayload = {
-      app: {
-        appid: this.config.appId!,
-        token: this.config.accessToken!,
-        cluster: (this.config.options?.['cluster'] as string) || 'volcengine_streaming_common',
-      },
-      user: {
-        uid: `mobileclaw-${uuid().slice(0, 8)}`,
-      },
-      audio: {
-        format: 'pcm',
-        rate: AUDIO_SAMPLE_RATE,
-        channel: 1,
-        bits: 16,
-        language: this.mapLanguage(this.config.language),
-      },
+    if (!this.ws || !this.cfg) return;
+    const frame = buildConfigFrame({
+      user: { uid: `mc-${uuid().slice(0, 8)}`, did: 'rn-app', platform: 'ReactNative', sdk_version: '1.0.0', app_version: '1.0.0' },
+      audio: { format: 'pcm', codec: 'raw', rate: AUDIO_SAMPLE_RATE, bits: 16, channel: 1 },
       request: {
-        reqid: `mc-${Date.now()}-${uuid().slice(0, 8)}`,
-        nbest: 1,
-        result_type: 'full',       // Request both partial + final results
+        model_name: 'bigmodel',
+        enable_itn: true, enable_punc: true, enable_ddc: false,
+        show_utterances: true, result_type: 'full',
+        end_window_size: 800, force_to_speech_time: 1000,
       },
-    };
-
-    log.debug('Sending ASR config:', {
-      ...payload,
-      app: { ...payload.app, token: '***' },
-    });
-
-    this.ws.send(JSON.stringify({
-      type: PAYLOAD_TYPE.CONFIG,
-      ...payload,
-    }));
+    }, this.seq++);
+    this.ws!.send(frame.buffer ?? frame);
   }
 
-  /**
-   * Map our language code to Volcengine ASR language code.
-   */
-  private mapLanguage(lang: string): string {
-    const map: Record<string, string> = {
-      'zh-CN': 'zh-CN',
-      'zh': 'zh-CN',
-      'en-US': 'en-US',
-      'en': 'en-US',
-    };
-    return map[lang] || 'zh-CN';
+  private onMessage(data: Uint8Array): void {
+    const r = parseResponse(data);
+    if (!r) return;
+
+    if (r.msgType === MT_SERVER_FULL) this.onFullResp(r);
+    else if (r.msgType === MT_SERVER_ERR) this.onErrResp(r);
   }
 
-  private startHeartbeat(): void {
-    this.stopHeartbeat();
-    this.heartbeatTimer = setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        try {
-          this.ws.send(JSON.stringify({ type: 'ping' }));
-        } catch {
-          // Ignore heartbeat errors
-        }
+  private onFullResp(r: ServerResp): void {
+    const res = r.json?.result;
+    if (!res) return;
+
+    const utts = res.utterances || [];
+    for (const u of utts.filter((u: { text?: string; definite?: boolean }) => u.definite)) {
+      if (u.text && !this.doneUtterances.includes(u.text)) {
+        this.doneUtterances.push(u.text);
+        log.info('Final:', u.text);
+        this.handlers?.onFinal(u.text, undefined);
       }
-    }, 10000); // 10s interval (same as @xmov/doubao-asr SDK)
-  }
-
-  private stopHeartbeat(): void {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
     }
-  }
-
-  private handleMessage(data: string | ArrayBuffer): void {
-    // v1 API returns JSON strings; ignore binary responses
-    if (typeof data !== 'string') return;
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(data);
-    } catch {
-      log.warn('Failed to parse ASR response:', String(data).slice(0, 200));
-      return;
-    }
-
-    const msg = parsed as Record<string, unknown>;
-
-    switch (msg.type) {
-      case RESULT_TYPE.INTERIM:
-      case 'partial_result':
-        this.handleInterim(msg as unknown as DoubaoResultPayload);
-        break;
-
-      case RESULT_TYPE.FINAL:
-      case 'final_result':
-        this.handleFinal(msg as unknown as DoubaoResultPayload);
-        break;
-
-      case RESULT_TYPE.ERROR:
-      case 'error':
-        this.handleError(msg as unknown as DoubaoResultPayload);
-        break;
-
-      case RESULT_TYPE.FINISHED:
-      case 'speech_finished':
-        log.info('Server confirmed speech finished');
-        break;
-
-      default:
-        // Ping response or unknown — silently ignore
-        if (msg.type !== 'ping') {
-          log.debug('Unknown ASR message type:', msg.type, msg);
-        }
-    }
-  }
-
-  private handleInterim(result: DoubaoResultPayload): void {
-    // v1 interim: { type: "partial_result", result: { text: "...", confidence: 0.95 } }
-    const text = this.extractText(result);
-    if (!text) return;
-
-    const confidence = result.result?.confidence;
-    log.debug('Interim:', text.slice(0, 50));
-
-    // Fire onInterim with the full current text (not delta)
-    this.handlers?.onInterim(text, confidence);
-  }
-
-  private handleFinal(result: DoubaoResultPayload): void {
-    // v1 final: { type: "final_result", result: { text: "...", confidence: 0.98 } }
-    const text = this.extractText(result);
-    if (!text) return;
-
-    const confidence = result.result?.confidence;
-
-    // Check if this is new text beyond what we've already accumulated
-    const prevLen = this.currentUtterance.length;
-
-    // v1 may send incremental finals or the complete text each time
-    // If the new text starts with our accumulated text, it's an extension
-    if (text.startsWith(this.currentUtterance) && text.length > prevLen) {
-      const newText = text.slice(prevLen);
-      this.currentUtterance = text;
-      log.info('Final (incremental):', newText);
-      this.handlers?.onFinal(newText, confidence);
-    } else if (!text.startsWith(this.currentUtterance)) {
-      // Completely new utterance (server reset or new sentence)
-      if (this.currentUtterance) {
-        // Push previous utterance before starting new one
-        this.completedUtterances.push(this.currentUtterance);
+    const interim = utts.filter((u: { text?: string; definite?: boolean }) => !u.definite);
+    if (interim.length > 0) {
+      const last = interim[interim.length - 1];
+      if (last.text !== this.interimText) {
+        this.interimText = last.text ?? '';
+        this.handlers?.onInterim(last.text ?? '', undefined);
       }
-      this.currentUtterance = text;
-      log.info('Final (new utterance):', text);
-      this.handlers?.onFinal(text, confidence);
     }
-    // If text === currentUtterance, it's a duplicate confirmation — skip
+    if (res.text && utts.length === 0 && res.text !== this.interimText) {
+      this.interimText = res.text;
+      this.handlers?.onInterim(res.text, undefined);
+    }
+    if (r.isLast) log.info('Server last-pkg received');
   }
 
-  private handleError(result: DoubaoResultPayload): void {
-    const msg = result.error_message || `ASR error code ${result.error_code}`;
-    log.error('Doubao ASR error:', msg);
+  private onErrResp(r: ServerResp): void {
+    const code = r.json?.error_code ?? r.errorCode ?? 0;
+    const msg = r.json?.error_message ?? `ASR err ${code}`;
+    log.error('Server error:', msg);
     this.handlers?.onError(new Error(msg));
   }
 
-  /**
-   * Extract text from various server response formats.
-   * Handles both v1 ({ result: { text } }) and v3 ({ result: { utterances: [{ text }] } })
-   */
-  private extractText(result: DoubaoResultPayload): string {
-    // v1 format: direct text field
-    if (result.result?.text) return result.result.text;
-
-    // v3/SDK format: utterances array — take last one's text
-    const utterances = (result.result as unknown as { utterances?: Array<{ text: string }> })?.utterances;
-    if (Array.isArray(utterances) && utterances.length > 0) {
-      const last = utterances[utterances.length - 1];
-      return last.text || '';
-    }
-
-    return '';
-  }
-
-  private attemptReconnect(): void {
-    this.reconnectAttempts++;
-    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts - 1), 10000);
-
-    log.warn(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
-
-    this.reconnectTimer = setTimeout(async () => {
-      const endpoint = this.config?.endpoint || DEFAULT_ENDPOINT;
+  private reconnect(ep: string, rid: string, cid: string): void {
+    this.reconnects++;
+    const delay = Math.min(1000 * Math.pow(2, this.reconnects - 1), 10000);
+    log.warn(`Reconnect in ${delay}ms (${this.reconnects}/${this.maxReconnects})`);
+    this.rcTimer = setTimeout(async () => {
       try {
-        await this.connect(endpoint);
+        await this.connect(ep, rid, uuid());
         this.sendConfig();
-        this.startHeartbeat();
-        log.info('Reconnected successfully');
-        this.reconnectAttempts = 0;
-      } catch (err) {
-        log.error('Reconnect failed:', err);
-        if (this.reconnectAttempts < this.maxReconnectAttempts) {
-          this.attemptReconnect();
-        } else {
-          this.handlers?.onError(new Error('ASR reconnect failed after max attempts'));
-        }
+        log.info('Reconnected');
+        this.reconnects = 0;
+      } catch (e) {
+        log.error('Reconnect fail:', e);
+        if (this.reconnects < this.maxReconnects) this.reconnect(ep, rid, cid);
+        else this.handlers?.onError(new Error('Reconnect exhausted'));
       }
     }, delay);
   }
 
   private close(): void {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    if (this.ws) {
-      try {
-        this.ws.close(1000, 'Client stop');
-      } catch {
-        // Ignore close errors
-      }
-      this.ws = null;
-    }
+    if (this.rcTimer) { clearTimeout(this.rcTimer); this.rcTimer = null; }
+    if (this.ws) { try { this.ws.close(); } catch { /* */ } this.ws = null; }
     this.connected = false;
     this.finished = false;
   }

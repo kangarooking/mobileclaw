@@ -186,7 +186,7 @@ test('Audio pipeline complete', () => {
   const doubaoAsr = readFileSync(join(SRC, 'services/audio/providers/DoubaoASRProvider.ts'), 'utf-8');
   if (!doubaoAsr.includes('appId')) throw new Error('DoubaoASRProvider missing appId credential field');
   if (!doubaoAsr.includes('accessToken')) throw new Error('DoubaoASRProvider missing accessToken credential field');
-  if (!doubaoAsr.includes('appid')) throw new Error('DoubaoASRProvider missing appid in config payload');
+  if (!doubaoAsr.includes('model_name')) throw new Error('DoubaoASRProvider missing model_name in config payload');
 
   // Verify SecureStorage has ASR credential methods
   const ss = readFileSync(join(SRC, 'services/storage/SecureStorage.ts'), 'utf-8');
