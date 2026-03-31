@@ -292,5 +292,65 @@ feat-07 详细:
   - feat-09: SecureStorage 原生模块（Ed25519 密钥安全存储）
 
 ----------------------------------------
+会话 #5 - feat-08~11 唤醒+存储+UI+飞书 + feat-12 集成测试收尾
+----------------------------------------
+时间: 2026-03-31
+
+完成工作:
+  [x] feat-08: iOS Siri Shortcut 语音唤醒（URL scheme mobileclaw://activate）
+    • UrlSchemeHandler.ts: RN Linking API (cold start getInitialURL + warm start addEventListener)
+    • ActivationParams 接口：gatewayId + siriInitiated
+    • WakeUpManager.activate(params?) 支持可选 gatewayId
+    • App.tsx 初始化 urlSchemeHandler
+    • useWakeUp hook 更新：navigate/goBack 参数
+
+  [x] feat-09: SecureStorage 原生模块（expo-secure-store 替代 XOR 占位）
+    • iOS Keychain / Android EncryptedSharedPreferences (AES256-GCM)
+    • 新方法：hasItem/setDevicePrivateKey/getDevicePrivateKey/setDevicePublicKey/getDeviceId
+    • namespace: com.mobileclaw.keystore:key
+
+  [x] feat-10: UI 打磨（暗色主题完善、动画、错误处理、Gateway CRUD）
+    • HomeScreen.tsx 重写：config.gateways 路径修复、类型安全、as const 样式
+    • SettingsScreen.tsx 重写：全部 StyleSheet.create()、secureTextEntry Token 输入
+    • SessionScreen: WaveformView 嵌入录制叠加层
+
+  [x] feat-11: 飞书历史记录推送（卡片 schema + 离线重试队列）
+    • FeishuPushService.pushTurn() 完整实现
+    • WakeUpManager.pushToFeishu(): deactivate() 前推送本轮对话
+    • 提取最后 user/AI 消息对，含 sessionId/durationMs 元数据
+
+  [x] feat-12: 端到端集成测试 + 项目收尾
+    • scripts/integration-test.mjs: 18 项自动化验证测试
+      - 项目结构 / 源文件完整性 / 类型定义 / Store 接线
+      - 服务层完整性（Gateway/Camera/Audio/WakeUp/URL handler）
+      - UI 组件存在性 / 依赖完整性 / app.json 配置 / Feature list 完整性
+    • 修复 6 个测试脚本 bug:
+      - URL 编码路径问题（decodeURIComponent）
+      - .findFiles() → .concat(findFiles()) 方法调用错误
+      - new error() → new Error() 大小写
+      - ttsts → tts 变量名拼写错误
+      - extname 比较 '..tsx' 双点号（ext 已含 dot）
+      - app.json scheme 路径（ios.scheme vs expo.scheme）+ Siri 路径（expo.ios.infoPlist）
+
+TS 编译状态: 全项目 0 错误 ✅
+集成测试状态: 18/18 通过 ✅
+Feature 完成度: 12/12 (100%) ✅
+
+项目总览:
+  - 38 个源文件（.ts + .tsx），覆盖完整架构
+  - 12 个 feature 全部通过验证
+  - 核心管线: 唤醒→Gateway连接→相机预览+ASR监听→chat.send→AI回复→TTS播放→自动待机→飞书推送
+  - 双策略视频: Strategy A(chat.send 附件) + Strategy B(video_frame 事件流)
+  - 双路径 TTS: openclaw tts.convert + Edge TTS(免费) + Doubao TTS(付费)
+  - 半双工音频: ASR/TTS 互斥切换，防回声
+  - 安全存储: Keychain(iOS)/Keystore(Android) 存储密钥和 Token
+
+下一步:
+  - 真机部署测试（需要 iOS 设备 + Xcode）
+  - Ed25519 原生签名模块（RN 环境需 TurboModule）
+  - 原生 JPEG Frame Processor 插件（当前 raw base64 ~600KB，JPEG 可压缩到 ~30KB）
+  - Android 端支持（Phase 2）
+
+----------------------------------------
 （后续会话在此追加，格式如下）
 ----------------------------------------
