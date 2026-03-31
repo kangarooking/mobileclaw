@@ -13,6 +13,7 @@ import { audioCaptureBridge } from '@/services/audio/AudioCaptureBridge';
 import { cameraManager } from '@/services/camera/CameraManager';
 import { frameSender } from '@/services/camera/frameSender';
 import { asrService } from '@/services/audio/ASRService';
+import { ttsService } from '@/services/audio/TTSService';
 import { gatewayClient } from '@/services/gateway/GatewayClient';
 import { useAppStore } from '@/store/useAppStore';
 import { useSessionStore } from '@/store/useSessionStore';
@@ -67,6 +68,7 @@ export class WakeUpManager {
 
       // 6. Bind services to gateway + start video stream
       frameSender.bindGateway(gatewayClient);
+      ttsService.bindGateway(gatewayClient);
       // Strategy B: Start continuous video_frame event stream (5fps default)
       frameSender.startContinuousStream();
 
@@ -87,6 +89,11 @@ export class WakeUpManager {
         onError: (err) => log.error('ASR error:', err),
       });
       sessionStore.setIsMicActive(true);
+
+      // 7c. Initialize TTS service
+      const ttsConfig = appStore.config.tts;
+      await ttsService.initialize(ttsConfig);
+      log.info('TTS initialized with path:', ttsConfig.type);
 
       // 7b. Start PCM audio capture bridge (feeds real-time audio to ASR)
       try {
@@ -128,8 +135,8 @@ export class WakeUpManager {
     await asrService.stopListening();
     useSessionStore.getState().setIsMicActive(false);
 
-    // 2. Stop any TTS playback
-    // (handled by TTSService.stop())
+    // 2b. Stop any TTS playback (half-duplex: resume ASR after)
+    await ttsService.stop();
 
     // 3. Stop camera
     useSessionStore.getState().setIsCameraActive(false);
@@ -167,17 +174,29 @@ export class WakeUpManager {
       const reply = await gatewayClient.chatSend(transcript, { attachments: attachments.length > 0 ? attachments : undefined });
 
       if (reply) {
+        // Extract text content from reply
+        const replyText = typeof reply === 'string' ? reply : JSON.stringify(reply);
+
         // Add AI response to chat history
         sessionStore.addMessage({
           id: uuid(),
           role: 'assistant',
-          content: typeof reply === 'string' ? reply : JSON.stringify(reply),
+          content: replyText,
           timestamp: Date.now(),
           hasVideoContext: attachments.length > 0,
         });
 
-        // Play TTS response
-        // (TTS playback will be triggered by the UI layer observing the message)
+        // Auto-play TTS response (half-duplex: pauses ASR while speaking)
+        try {
+          await ttsService.speak(replyText, {
+            onStart: () => log.info('TTS started for AI response'),
+            onDone: () => log.info('TTS finished'),
+            onError: (err) => log.warn('TTS playback failed (non-critical):', err),
+          });
+        } catch (ttsErr) {
+          // TTS failure should not break the conversation flow
+          log.warn('TTS error (non-critical):', ttsErr);
+        }
       }
     } catch (error) {
       log.error('Failed to send message:', error);
