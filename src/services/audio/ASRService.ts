@@ -1,8 +1,13 @@
 /**
  * ASRService — Pluggable speech recognition abstraction
+ *
+ * Manages ASR provider lifecycle and provides a unified interface
+ * for streaming speech recognition. The active provider handles
+ * connection management, audio streaming, and result dispatching.
  */
 
 import type { ASRProviderConfig } from '@/types/config';
+import { DoubaoASRProvider } from './providers/DoubaoASRProvider';
 import { getLogger } from '@/utils/logger';
 
 const log = getLogger('ASRService');
@@ -18,54 +23,18 @@ export interface ASRProvider {
   startListening(handlers: ASREventHandlers): Promise<void>;
   stopListening(): Promise<void>;
   destroy(): Promise<void>;
+  /** Feed PCM audio data (for providers that accept external audio input) */
+  feedPCM?(data: ArrayBuffer | Uint8Array): void;
 }
 
 /**
- * Doubao ASR Provider (Phase 1 primary)
+ * ASRService — Main entry point that delegates to the active provider.
  *
- * Connects to Doubao's streaming ASR WebSocket API.
- * Sends PCM audio chunks, receives interim + final transcripts.
- */
-export class DoubaoASRProvider implements ASRProvider {
-  private ws: WebSocket | null = null;
-  private config: ASRProviderConfig | null = null;
-
-  async initialize(config: ASRProviderConfig): Promise<void> {
-    this.config = config;
-    log.info('DoubaoASR initialized with endpoint:', config.endpoint);
-    // TODO: Implement actual Doubao WS connection
-    // Doubao streaming ASR typically:
-    // 1. Connect to wss://openspeech.bytedance.com/api/v1/asr
-    // 2. Send config JSON with appid, token, language, codec
-    // 3. Stream PCM binary frames
-    // 4. Receive JSON responses with result type (interim/final)
-  }
-
-  async startListening(handlers: ASREventHandlers): Promise<void> {
-    if (!this.config?.endpoint) {
-      handlers.onError(new Error('Doubao ASR endpoint not configured'));
-      return;
-    }
-    log.info('DoubaoASR starting listening...');
-    // TODO: Open WS connection and start streaming audio
-    // For now, simulate with a stub for development
-  }
-
-  async stopListening(): Promise<void> {
-    log.info('DoubaoASR stopping listening...');
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
-  }
-
-  async destroy(): Promise<void> {
-    await this.stopListening();
-  }
-}
-
-/**
- * ASRService — Main entry point that delegates to the active provider
+ * Usage:
+ *   await asrService.initialize(config);
+ *   await asrService.startListening({ onInterim, onFinal, onError });
+ *   // ... feed PCM data via asrService.feedPCM(pcmData) ...
+ *   await asrService.stopListening();
  */
 export class ASRService {
   private provider: ASRProvider | null = null;
@@ -80,19 +49,35 @@ export class ASRService {
         throw new Error(`Unsupported ASR type: ${config.type}`);
     }
     await this.provider.initialize(config);
+    log.info('ASR service initialized with provider:', config.type);
   }
 
   async startListening(handlers: ASREventHandlers): Promise<void> {
-    if (!this.provider) throw new Error('ASR not initialized');
-    if (this.isListening) return;
+    if (!this.provider) throw new Error('ASR not initialized. Call initialize() first.');
+    if (this.isListening) {
+      log.warn('ASR already listening, ignoring startListening()');
+      return;
+    }
     this.isListening = true;
     await this.provider.startListening(handlers);
+    log.info('ASR started listening');
+  }
+
+  /**
+   * Feed raw PCM audio data to the active ASR provider.
+   * No-op if no provider or provider doesn't support feedPCM.
+   *
+   * @param pcmData Raw PCM Int16 audio (16kHz/mono/16bit)
+   */
+  feedPCM(pcmData: ArrayBuffer | Uint8Array): void {
+    this.provider?.feedPCM?.(pcmData);
   }
 
   async stopListening(): Promise<void> {
     if (!this.provider || !this.isListening) return;
     this.isListening = false;
     await this.provider.stopListening();
+    log.info('ASR stopped listening');
   }
 
   getIsListening(): boolean {

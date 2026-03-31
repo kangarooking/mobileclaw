@@ -9,6 +9,7 @@
  */
 
 import { audioManager } from '@/services/audio/AudioManager';
+import { audioCaptureBridge } from '@/services/audio/AudioCaptureBridge';
 import { cameraManager } from '@/services/camera/CameraManager';
 import { frameSender } from '@/services/camera/frameSender';
 import { asrService } from '@/services/audio/ASRService';
@@ -87,6 +88,13 @@ export class WakeUpManager {
       });
       sessionStore.setIsMicActive(true);
 
+      // 7b. Start PCM audio capture bridge (feeds real-time audio to ASR)
+      try {
+        await audioCaptureBridge.startCapture();
+      } catch (err) {
+        log.warn('Audio capture bridge failed (non-critical, ASR may not receive audio):', err);
+      }
+
       // 8. Set mode to active
       sessionStore.setMode('active');
       log.info('✅ MobileClaw fully activated!');
@@ -110,7 +118,10 @@ export class WakeUpManager {
     this.stopIdleMonitor();
 
     // Graceful shutdown order matters!
-    // 1. Stop mic recording first
+    // 0. Stop PCM capture bridge (stops feeding ASR)
+    await audioCaptureBridge.stopCapture();
+
+    // 1. Stop mic recording (waveform visualization)
     await audioManager.stopRecording();
 
     // 2. Stop ASR
