@@ -7,26 +7,24 @@
  *  - Automatic permission request on first mount
  */
 
-import React, { useCallback, useEffect, useMemo, useRef } from 'react';
+import React, { useMemo, useRef, useEffect } from 'react';
 import {
   View,
   StyleSheet,
   Text,
   Platform,
 } from 'react-native';
+import * as FileSystem from 'expo-file-system/legacy';
 import {
   Camera,
   useCameraDevices,
-  useFrameProcessor,
 } from 'react-native-vision-camera';
-import { useSharedValue, runOnJS } from 'react-native-reanimated';
+// TODO: re-enable useFrameProcessor after fixing vision-camera v4.7.3 babel compat
+// import { useFrameProcessor } from 'react-native-vision-camera';
+// import { useSharedValue, runOnJS } from 'react-native-reanimated';
 import { cameraManager } from '@/services/camera/CameraManager';
-import {
-  processFrame,
-  setFrameCallback as registerFrameCallback,
-  resetFrameCount,
-  getFrameCount,
-} from './frameProcessorWorklet';
+import { useAppStore } from '@/store/useAppStore';
+import { getLogger } from '@/utils/logger';
 
 interface CameraPreviewProps {
   isActive: boolean;
@@ -39,9 +37,24 @@ export function CameraPreview({
   onFrameReady,
   style,
 }: CameraPreviewProps) {
+  const log = getLogger('CameraPreview');
   const devices = useCameraDevices();
-  const frameCount = useSharedValue(0);
   const isInitialized = useRef(false);
+  const cameraRef = useRef<Camera | null>(null);
+  const snapshotBusyRef = useRef(false);
+  const videoConfig = useAppStore((state) => state.config.video);
+
+  useEffect(() => {
+    if (!onFrameReady) return;
+    cameraManager.onFrameReady = (dataBase64, width, height) => {
+      onFrameReady(dataBase64, width, height);
+    };
+    return () => {
+      if (cameraManager.onFrameReady) {
+        cameraManager.onFrameReady = null;
+      }
+    };
+  }, [onFrameReady]);
 
   // Find back camera device (prefer low-light boost capable)
   const device = useMemo(() => {
@@ -52,45 +65,25 @@ export function CameraPreview({
     );
   }, [devices]);
 
-  // ─── Frame Processor Setup ──────────────────────────────────────
-  // Bridge frames from worklet thread → JS main thread → parent + CameraManager
+  void isInitialized;
 
-  const handleFrameReady = useCallback(
-    (dataBase64: string, width: number, height: number, _timestamp: number) => {
-      // Update CameraManager's latest frame cache
-      cameraManager.onNewFrame(dataBase64, width, height, Date.now());
-
-      // Notify parent component
-      onFrameReady?.(dataBase64, width, height);
-
-      // Update debug counter
-      frameCount.value = getFrameCount();
-    },
-    [onFrameReady, frameCount],
-  );
-
-  // Wrap in runOnJS for worklet→main-thread bridge
-  // runOnJS(fn) returns a function that calls fn on the main thread when invoked
-  const handleFrameReadyJS = runOnJS(handleFrameReady);
-
-  // Register callback once on mount
   useEffect(() => {
-    registerFrameCallback(handleFrameReadyJS);
+    if (!isActive || !device) return;
+
+    const snapshotFps = Math.max(1, Math.min(videoConfig.bufferFps, 4));
+    const intervalMs = Math.max(250, Math.round(1000 / snapshotFps));
+    const [width, height] = videoConfig.resolution
+      .split('x')
+      .map((value) => Number(value));
+
+    const timer = setInterval(() => {
+      void captureSnapshot(width || 640, height || 480);
+    }, intervalMs);
+
     return () => {
-      registerFrameCallback(() => {});
+      clearInterval(timer);
     };
-  }, [handleFrameReadyJS]);
-
-  // Attach frame processor (processFrame handles throttling internally)
-  const frameProcessor = useFrameProcessor(processFrame, []);
-
-  // Reset counter on first activation
-  useEffect(() => {
-    if (isActive && !isInitialized.current) {
-      resetFrameCount();
-      isInitialized.current = true;
-    }
-  }, [isActive]);
+  }, [device, isActive, videoConfig.bufferFps, videoConfig.jpegQuality, videoConfig.resolution]);
 
   // ─── Permission & Device Check ─────────────────────────────────
 
@@ -98,11 +91,11 @@ export function CameraPreview({
     return (
       <View style={[styles.container, style]}>
         <View style={styles.errorContainer}>
-          <Text style={styles.errorText}>No camera available</Text>
+          <Text style={styles.errorText}>没有可用摄像头</Text>
           <Text style={styles.errorSubtext}>
             {Platform.OS === 'ios'
-              ? 'Enable camera in Settings > Privacy > Camera'
-              : 'Check camera hardware availability'}
+              ? '请到系统设置里开启摄像头权限'
+              : '请检查设备摄像头权限与硬件状态'}
           </Text>
         </View>
       </View>
@@ -112,31 +105,43 @@ export function CameraPreview({
   return (
     <View style={[styles.container, style]}>
       <Camera
+        ref={cameraRef}
         style={StyleSheet.absoluteFill}
         device={device}
         isActive={isActive}
-        photo={false}
-        pixelFormat="yuv"
-        frameProcessor={frameProcessor}
+        photo
+        video
         lowLightBoost={device.supportsLowLightBoost}
       />
-
-      {/* Recording indicator overlay */}
-      {isActive && (
-        <View style={styles.recordingOverlay}>
-          <View style={styles.recordingDot} />
-          <Text style={styles.recordingText}>REC</Text>
-        </View>
-      )}
-
-      {/* Debug badge */}
-      {isActive && (
-        <View style={styles.frameBadge}>
-          <Text style={styles.frameBadgeText}>LIVE</Text>
-        </View>
-      )}
     </View>
   );
+
+  async function captureSnapshot(width: number, height: number): Promise<void> {
+    if (!cameraRef.current || snapshotBusyRef.current) return;
+    snapshotBusyRef.current = true;
+
+    try {
+      const snapshot = await (cameraRef.current as any).takeSnapshot({
+        quality: Math.round(videoConfig.jpegQuality * 100),
+        skipMetadata: true,
+      });
+
+      const path = typeof snapshot?.path === 'string' ? snapshot.path : null;
+      if (!path) return;
+
+      const normalizedPath = path.startsWith('file://') ? path : `file://${path}`;
+      const base64 = await FileSystem.readAsStringAsync(normalizedPath, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      const timestamp = Date.now();
+      log.info(`Snapshot captured: ${width}x${height}, base64=${base64.length} chars`);
+      cameraManager.onNewFrame(base64, width, height, timestamp);
+    } catch {
+      // Snapshot capture can fail while preview warms up; keep retrying silently.
+    } finally {
+      snapshotBusyRef.current = false;
+    }
+  }
 }
 
 // ─── Styles ───────────────────────────────────────────────────────
@@ -165,45 +170,6 @@ const styles = StyleSheet.create({
     color: '#888',
     fontSize: 13,
     textAlign: 'center',
-  },
-  recordingOverlay: {
-    position: 'absolute',
-    bottom: 40,
-    alignSelf: 'center',
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: 'rgba(220, 38, 38, 0.75)',
-    borderRadius: 20,
-    paddingHorizontal: 14,
-    paddingVertical: 7,
-    gap: 8,
-  },
-  recordingDot: {
-    width: 10,
-    height: 10,
-    borderRadius: 5,
-    backgroundColor: '#ef4444',
-  },
-  recordingText: {
-    color: '#fff',
-    fontSize: 13,
-    fontWeight: '700',
-    letterSpacing: 2,
-  },
-  frameBadge: {
-    position: 'absolute',
-    top: 10,
-    right: 10,
-    backgroundColor: 'rgba(0, 0, 0, 0.6)',
-    borderRadius: 8,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-  },
-  frameBadgeText: {
-    color: '#22c55e',
-    fontSize: 11,
-    fontFamily: 'monospace',
-    fontWeight: 'bold',
   },
 });
 

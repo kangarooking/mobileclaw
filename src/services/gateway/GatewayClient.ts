@@ -17,7 +17,7 @@
  * Based on: openclaw source code & integration tests
  */
 
-import { v4 as uuid } from 'uuid';
+import { generateUUID } from '@/utils/rnCompat';
 import type {
   GatewayFrame,
   RequestFrame,
@@ -37,8 +37,15 @@ import {
   PROTOCOL_VERSION,
 } from '@/utils/constants';
 import { getLogger } from '@/utils/logger';
+import { DeviceIdentityService } from './DeviceIdentityService';
+import nacl from 'tweetnacl';
+import { stringToUint8 } from '@/utils/rnCompat';
 
 const log = getLogger('GatewayClient');
+
+function binaryToString(bytes: Uint8Array): string {
+  return String.fromCharCode(...Array.from(bytes));
+}
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -56,7 +63,7 @@ interface PendingRequest {
 export interface DeviceIdentity {
   deviceId: string;       // SHA-256 hex of raw public key
   publicKeyB64Url: string; // Raw 32-byte Ed25519 public key, base64url-encoded
-  privateKeyPem: string;   // PKCS#8 PEM private key (store securely!)
+  privateKeySeedB64Url: string;   // 32-byte Ed25519 seed, base64url-encoded
 }
 
 // ─── GatewayClient ──────────────────────────────────────────────────
@@ -97,6 +104,23 @@ export class GatewayClient {
     return this.helloOkPayload;
   }
 
+  private describeConnectionError(err: unknown): string {
+    if (typeof err === 'string') return err;
+    if (err instanceof Error && err.message) return err.message;
+    if (err && typeof err === 'object') {
+      const maybeMessage = (err as { message?: unknown }).message;
+      const maybeType = (err as { type?: unknown }).type;
+      if (typeof maybeMessage === 'string' && maybeMessage.trim()) return maybeMessage;
+      if (typeof maybeType === 'string' && maybeType.trim()) return maybeType;
+      try {
+        return JSON.stringify(err);
+      } catch {
+        return String(err);
+      }
+    }
+    return String(err);
+  }
+
   /**
    * Set the device identity (call before connect()).
    * Generated once on first launch and persisted in SecureStorage.
@@ -124,52 +148,129 @@ export class GatewayClient {
     this.attempt = 0;
 
     return new Promise((resolve, reject) => {
+      let settled = false;
+      let step = 'init';
+
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        log.error(`Connection timed out at step "${step}" after 15s`);
+        this.setStatus('error');
+        if (this.ws) { this.ws.close(4002, 'connect_timeout'); this.ws = null; }
+        reject(new Error(`Gateway connection timed out at step "${step}" (15s)`));
+      }, 15000);
+
+      const settle = (result: HelloOkPayload | Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        if (result instanceof Error) reject(result); else resolve(result);
+      };
+
       try {
         this.setStatus('connecting');
+        step = 'tcp-connect';
         this.ws = new WebSocket(wsUrl);
 
         this.ws.onopen = () => {
-          log.info('WebSocket connection opened to', wsUrl);
+          step = 'waiting-challenge';
+          log.info('[CONNECT] TCP connected, waiting for challenge...');
         };
+
+        // ─── Inline handshake: challenge → connect req → hello-ok ───
+        // Same pattern proven to work by the HomeScreen diagnostic.
+        let receivedChallenge = false;
 
         this.ws.onmessage = (event) => {
           try {
-            const frame: GatewayFrame = JSON.parse(typeof event.data === 'string' ? event.data : '');
-            this.handleFrame(frame);
-
-            if (
-              frame.type === 'res' &&
-              frame.payload &&
-              (frame.payload as Record<string, unknown>).type === 'hello-ok'
-            ) {
-              this.helloOkPayload = frame.payload as HelloOkPayload;
-              this.setStatus('connected');
-              this.attempt = 0;
-              this.startHeartbeat();
-              resolve(this.helloOkPayload);
+            // CRITICAL: RN may send data as ArrayBuffer (binary) — convert to string
+            let raw: string;
+            if (typeof event.data === 'string') {
+              raw = event.data;
+            } else if (event.data instanceof ArrayBuffer) {
+              raw = binaryToString(new Uint8Array(event.data));
+            } else if (ArrayBuffer.isView(event.data)) {
+              raw = binaryToString(new Uint8Array(event.data.buffer, event.data.byteOffset, event.data.byteLength));
+            } else {
+              raw = String(event.data);
             }
+            const frame = JSON.parse(raw) as Record<string, unknown>;
+            const frameType = frame.type as string;
+
+            log.info('[CONNECT RX]', frameType, '| event:', (frame as Record<string, unknown>).event ?? '-', '| id:', (frame as Record<string, unknown>).id ?? '-');
+
+            if (frameType === 'event' && (frame as Record<string, unknown>).event === 'connect.challenge') {
+              // Step 1: Received challenge → send connect request
+              step = 'sending-connect';
+              receivedChallenge = true;
+              const payload = frame.payload as Record<string, unknown>;
+              this.challengeNonce = (payload.nonce as string) ?? '';
+              log.info('[CONNECT] Got challenge, sending connect request...');
+
+              this.sendConnectRequest();
+              step = 'waiting-hello-ok';
+              return;
+            }
+
+            if (frameType === 'res') {
+              // Step 2: Received response — check for hello-ok
+              const payload = frame.payload as Record<string, unknown> | undefined;
+              const payloadType = payload?.type as string | undefined;
+
+              if (payloadType === 'hello-ok' && !settled) {
+                step = 'connected';
+                log.info('[CONNECT] ✅ Got hello-ok! Handshake complete.');
+                this.helloOkPayload = frame.payload as HelloOkPayload;
+                this.setStatus('connected');
+                this.attempt = 0;
+                this.startHeartbeat();
+                settle(this.helloOkPayload);
+                return;
+              }
+
+              // Handle other res frames (RPC responses) via normal pipeline
+              this.handleResponse(frame as unknown as ResponseFrame);
+
+              // If connect was rejected and we haven't settled yet, reject
+              const ok = (frame as Record<string, unknown>).ok;
+              if (ok === false && !settled && receivedChallenge) {
+                const err = frame.error as Record<string, unknown> | undefined;
+                settle(new Error(`Server rejected connect: [${err?.code}] ${err?.message}`));
+              }
+              return;
+            }
+
+            // Other frames during connect (tick, health, etc.) — pass to normal handlers
+            this.handleFrame(frame as unknown as GatewayFrame);
+
           } catch (e) {
-            log.error('Failed to parse frame', e);
+            log.error('[CONNECT] Failed to process message:', e);
           }
         };
 
         this.ws.onclose = (event) => {
-          log.info('WebSocket closed', event.code, event.reason);
+          log.info('[CONNECT] WS closed:', event.code, event.reason, '| step:', step);
           this.handleDisconnect(event.code, event.reason);
-          if (this._status === 'connecting') {
-            reject(new Error(`Connection closed: ${event.reason} (${event.code})`));
+          if (!settled) {
+            settle(new Error(`Connection closed at step "${step}": ${event.reason} (${event.code})`));
           }
         };
 
-        this.ws.onerror = () => {
-          log.error('WebSocket error');
-          this.setStatus('error');
-          if (this._status === 'connecting') {
-            reject(new Error('WebSocket connection error'));
+        this.ws.onerror = (err) => {
+          // RN WebSocket often fires spurious onerror after successful handshake
+          // Only treat it as real error if we haven't settled yet
+          if (!settled) {
+            const detail = this.describeConnectionError(err);
+            log.warn('[CONNECT] WS error at step:', step, detail);
+            this.setStatus('error');
+            settle(new Error(`WebSocket error at step "${step}": ${detail}`));
+          } else {
+            const errWithMessage = err as { message?: string };
+            log.warn('[CONNECT] Spurious WS error after connect (ignored):', errWithMessage.message || String(err));
           }
         };
       } catch (e) {
-        reject(e);
+        settle(e as Error);
       }
     });
   }
@@ -255,12 +356,15 @@ export class GatewayClient {
 
     // If we have device identity, attach it (required for scoped access)
     if (this.deviceIdentity && this.challengeNonce) {
-      connectParams.device = this.buildDeviceAuthObject(clientInfo) as unknown as undefined;
+      const deviceAuth = this.buildDeviceAuthObject(clientInfo);
+      if (deviceAuth) {
+        connectParams.device = deviceAuth as ConnectParams['device'];
+      }
     }
 
     const frame: RequestFrame = {
       type: 'req',
-      id: uuid(),
+      id: generateUUID(),
       method: 'connect',
       params: connectParams,
     };
@@ -271,29 +375,65 @@ export class GatewayClient {
   }
 
   /**
-   * Build the device object for the connect request.
-   * This requires native Ed25519 crypto (see DeviceIdentityService).
-   * For now, this is a placeholder that returns null until the native module is ready.
-   * The test script (scripts/test-gateway-connection.mjs) proves the full flow works.
+   * Build the device auth object for scoped gateway access.
    */
-  private buildDeviceAuthObject(clientInfo: { platform: string; deviceFamily: string }): Record<string, unknown> | null {
+  private buildDeviceAuthObject(clientInfo: { platform: string; deviceFamily: string }): ConnectParams['device'] | null {
     if (!this.deviceIdentity || !this.challengeNonce) return null;
+    const signedAt = Date.now();
+    const scopes = ['operator.read', 'operator.write'];
+    const payload = this.buildDeviceAuthPayload({
+      deviceId: this.deviceIdentity.deviceId,
+      clientId: 'openclaw-ios',
+      clientMode: 'ui',
+      role: 'operator',
+      scopes,
+      signedAtMs: signedAt,
+      token: this.token,
+      nonce: this.challengeNonce,
+      platform: clientInfo.platform,
+      deviceFamily: clientInfo.deviceFamily,
+    });
 
-    // TODO: When native Ed25519 module is available:
-    // 1. Build v3 auth payload string from connect params + challenge nonce
-    // 2. Sign it with deviceIdentity.privateKeyPem using Ed25519
-    // 3. Return { id, publicKey, signature, signedAt, nonce }
-    //
-    // Payload format (MUST match server's buildDeviceAuthPayloadV3 exactly):
-    //   "v3|{deviceId}|{clientId}|{clientMode}|{role}|{scopes}|{signedAtMs}|{token}|{nonce}|{platform_norm}|{deviceFamily_norm}"
-    //
-    // Platform/deviceFamily normalization: trim + ASCII lowercase only
-    //
-    // See scripts/test-gateway-connection.mjs for working reference implementation
+    const secretKey = DeviceIdentityService.getSecretKey(this.deviceIdentity);
+    const signature = nacl.sign.detached(stringToUint8(payload), secretKey);
 
-    log.warn('Device identity present but Ed25519 signing not yet implemented in RN context');
-    log.warn('Falling back to unauthenticated connect (scopes will be empty)');
-    return null;
+    return {
+      id: this.deviceIdentity.deviceId,
+      publicKey: this.deviceIdentity.publicKeyB64Url,
+      signature: DeviceIdentityService.toBase64Url(signature),
+      signedAt,
+      nonce: this.challengeNonce,
+    };
+  }
+
+  private buildDeviceAuthPayload(params: {
+    deviceId: string;
+    clientId: string;
+    clientMode: string;
+    role: string;
+    scopes: string[];
+    signedAtMs: number;
+    token: string;
+    nonce: string;
+    platform: string;
+    deviceFamily: string;
+  }): string {
+    const normalize = (value: string): string => value.trim().replace(/[A-Z]/g, (ch) =>
+      String.fromCharCode(ch.charCodeAt(0) + 32));
+
+    return [
+      'v3',
+      params.deviceId,
+      params.clientId,
+      params.clientMode,
+      params.role,
+      params.scopes.join(','),
+      String(params.signedAtMs),
+      params.token,
+      params.nonce,
+      normalize(params.platform),
+      normalize(params.deviceFamily),
+    ].join('|');
   }
 
   /**
@@ -305,7 +445,7 @@ export class GatewayClient {
       throw new Error('Not connected');
     }
 
-    const id = uuid();
+    const id = generateUUID();
 
     return new Promise<T>((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -328,9 +468,13 @@ export class GatewayClient {
     return this.rpc('chat.send', {
       sessionKey: options?.sessionKey ?? 'main:webchat:mobileclaw',
       message,
-      idempotencyKey: `mobileclaw-${Date.now()}-${uuid().slice(0, 8)}`,
+      idempotencyKey: `mobileclaw-${Date.now()}-${generateUUID().slice(0, 8)}`,
       ...(options?.attachments ? { attachments: options.attachments } : {}),
     });
+  }
+
+  async chatHistory(sessionKey: string, limit: number = 20): Promise<unknown> {
+    return this.rpc('chat.history', { sessionKey, limit });
   }
 
   private sendRaw(data: string): void {

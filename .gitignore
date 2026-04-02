@@ -32,10 +32,27 @@ yarn-error.*
 
 # local env files
 .env*.local
+.env
+.env.*
 
 # typescript
 *.tsbuildinfo
 
-# generated native folders
-/ios
-/android
+# native build outputs
+ios/build/
+ios/Pods/
+android/.gradle/
+android/app/build/
+android/build/
+
+# local research / scratch files
+AI_HANDOFF_*.md
+progress.txt
+ScreenRecording_*.mp4
+SpeechDemoIOS 2/
+readmesauc.md
+sauc_websocket_demo.py
+test-asr.mjs
+mobileclaw-logo.jpg
+豆包ASR文档.md
+豆包TTS文档-iOS.md

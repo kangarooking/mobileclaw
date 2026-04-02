@@ -2,14 +2,11 @@
  * DoubaoASRProvider - Volcengine/Doubao streaming speech recognition
  *
  * Official binary protocol (v3):
- *   - Auth via HTTP headers: X-Api-App-Key, X-Api-Access-Key, X-Api-Resource-Id
+ *   - Auth via HTTP headers: X-Api-App-Key, X-Api-Access-Key, etc.
  *   - Binary frames: 4B header + 4B seq/size + gzip payload
- *   - Endpoint: wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async *
- * RN Note: Built-in WebSocket does not support custom HTTP headers on upgrade.
- *          For production, replace with a native WS module (e.g. ThermalWS)
- *          or bridge to platform-native Volcengine SDK.
- *          This impl passes credentials via query params as fallback.
+ *   - Endpoint: wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream
  *
+ * Uses native HeaderWebSocket module for custom HTTP header support.
  * Reference: sauc_websocket_demo.py (official Python demo)
  */
 
@@ -17,158 +14,104 @@ import type { ASRProvider, ASREventHandlers } from '../ASRService';
 import type { ASRProviderConfig } from '@/types/config';
 import { getLogger } from '@/utils/logger';
 import { AUDIO_SAMPLE_RATE } from '@/utils/constants';
-import { v4 as uuid } from 'uuid';
-// pako has no @types package — suppress import type error
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const { gzip, ungzip } = require('pako') as { gzip: (d: Uint8Array) => Uint8Array; ungzip: (d: Uint8Array) => Uint8Array };
+import { generateUUID, stringToUint8, uint8ToString } from '@/utils/rnCompat';
+import { NativeModules, NativeEventEmitter } from 'react-native';
+import { gzipSync, unzipSync } from 'fflate';
 
 const log = getLogger('DoubaoASR');
 
-const DEFAULT_ENDPOINT = 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async';
+const DEFAULT_ENDPOINT = 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream';
 const DEFAULT_RESOURCE_ID = 'volc.bigasr.sauc.duration';
 
-// Message types (upper nibble of byte 1)
-const MT_CLIENT_FULL  = 0x10;
-const MT_CLIENT_AUDIO = 0x20;
-const MT_SERVER_FULL  = 0x90;
-const MT_SERVER_ERR   = 0xF0;
+// Message types (4-bit values, shifted into upper nibble by buildHeader)
+// Reference: sauc_websocket_demo.py official demo
+const MT_CLIENT_FULL  = 0x01;
+const MT_CLIENT_AUDIO = 0x02;
+const MT_SERVER_FULL  = 0x09;
+const MT_SERVER_ERR   = 0x0F;
 
 // Flags (lower nibble of byte 1)
-const F_NO_SEQ     = 0x00;
 const F_POS_SEQ    = 0x01;
-const F_NEG_SEQ    = 0x02;
 const F_NEG_WSEQ   = 0x03;
 
 interface ServerResp {
-  msgType: number;
+  mt: number;
   isLast: boolean;
   errorCode?: number | null;
   json?: {
-    result?: {
-      text?: string;
-      utterances?: Array<{ text: string; definite?: boolean }>;
-    };
+    result?: { text?: string; utterances?: Array<{ text: string; definite?: boolean }> };
     error_code?: number;
     error_message?: string;
   };
 }
 
-// ─── Uint8Array Helpers (RN-compatible Buffer replacement) ────────
+// ─── Helpers ──────────────────────────────────────────────────────
 
-function u8alloc(n: number): Uint8Array {
-  return new Uint8Array(n);
+function u8alloc(n: number): Uint8Array { return new Uint8Array(n); }
+function w32(buf: Uint8Array, o: number, v: number): void {
+  buf[o]=(v>>>24)&0xff; buf[o+1]=(v>>>16)&0xff; buf[o+2]=(v>>>8)&0xff; buf[o+3]=v&0xff;
 }
-
-function writeU32BE(buf: Uint8Array, offset: number, val: number): void {
-  buf[offset]     = (val >>> 24) & 0xff;
-  buf[offset + 1] = (val >>> 16) & 0xff;
-  buf[offset + 2] = (val >>> 8) & 0xff;
-  buf[offset + 3] = val & 0xff;
+function r32(b: Uint8Array, o: number): number {
+  return ((b[o]&0xff)<<24)|((b[o+1]&0xff)<<16)|((b[o+2]&0xff)<<8)|(b[o+3]&0xff);
 }
-
-function readU32BE(buf: Uint8Array, offset: number): number {
-  return ((buf[offset] & 0xff) << 24) |
-         ((buf[offset + 1] & 0xff) << 16) |
-         ((buf[offset + 2] & 0xff) << 8) |
-         (buf[offset + 3] & 0xff);
+function concat(...p: Uint8Array[]): Uint8Array {
+  const t = p.reduce((s,x)=>s+x.length,0), r=new Uint8Array(t); let o=0;
+  for(const x of p){r.set(x,o);o+=x.length;} return r;
 }
-
-function readI32BE(buf: Uint8Array, offset: number): number {
-  const v = readU32BE(buf, offset);
-  return v | 0; // convert to signed int32
-}
-
-function concat(...parts: Uint8Array[]): Uint8Array {
-  const total = parts.reduce((s, p) => s + p.length, 0);
-  const result = new Uint8Array(total);
-  let off = 0;
-  for (const p of parts) {
-    result.set(p, off);
-    off += p.length;
-  }
-  return result;
-}
-
-function toU8(data: ArrayBuffer | Uint8Array): Uint8Array {
-  if (data instanceof Uint8Array) return data;
-  return new Uint8Array(data);
+function toU8(d: ArrayBuffer|Uint8Array): Uint8Array {
+  return d instanceof Uint8Array ? d : new Uint8Array(d);
 }
 
 // ─── Binary Protocol ───────────────────────────────────────────────
 
-function buildHeader(msgType: number, flags: number): Uint8Array {
-  const b = u8alloc(4);
-  b[0] = 0x11; // version=1, header_size=1
-  b[1] = (msgType << 4) | flags;
-  b[2] = 0x11; // json serialization + gzip compression
-  b[3] = 0x00;
-  return b;
+function buildHeader(mt: number, f: number): Uint8Array {
+  const b=u8alloc(4); b[0]=0x11; b[1]=((mt&0x0f)<<4)|(f&0x0f); b[2]=0x11; b[3]=0x00; return b;
 }
 
 function buildConfigFrame(payload: object, seq: number): Uint8Array {
-  const jsonBytes = new TextEncoder().encode(JSON.stringify(payload));
-  const compressed = gzip(jsonBytes);
-  const hdr = buildHeader(MT_CLIENT_FULL, F_POS_SEQ);
-  const seqBuf = u8alloc(4); writeU32BE(seqBuf, 0, seq);
-  const szBuf = u8alloc(4); writeU32BE(szBuf, 0, compressed.length);
-  return concat(hdr, seqBuf, szBuf, compressed);
+  const c=gzipSync(stringToUint8(JSON.stringify(payload)));
+  const h=buildHeader(MT_CLIENT_FULL,F_POS_SEQ);
+  const s=u8alloc(4); w32(s,0,seq); const sz=u8alloc(4); w32(sz,0,c.length);
+  return concat(h,s,sz,c);
 }
 
-function buildAudioFrame(data: ArrayBuffer | Uint8Array, seq: number, isLast: boolean): Uint8Array {
-  const input = toU8(data);
-  const compressed = gzip(input);
-  const flags = isLast ? F_NEG_WSEQ : F_POS_SEQ;
-  const actualSeq = isLast ? -seq : seq;
-  const hdr = buildHeader(MT_CLIENT_AUDIO, flags);
-  const seqBuf = u8alloc(4); writeU32BE(seqBuf, 0, actualSeq);
-  const szBuf = u8alloc(4); writeU32BE(szBuf, 0, compressed.length);
-  return concat(hdr, seqBuf, szBuf, compressed);
+function buildAudioFrame(data: ArrayBuffer|Uint8Array, seq: number, last: boolean): Uint8Array {
+  const input=toU8(data), c=gzipSync(input);
+  const h=buildHeader(MT_CLIENT_AUDIO, last?F_NEG_WSEQ:F_POS_SEQ);
+  const s=u8alloc(4); w32(s,0,last?-seq:seq); const sz=u8alloc(4); w32(sz,0,c.length);
+  return concat(h,s,sz,c);
 }
 
-function parseResponse(raw: ArrayBuffer | Uint8Array): ServerResp | null {
-  const b = toU8(raw);
-  if (b.length < 5) return null;
+function parseResponse(raw: ArrayBuffer|Uint8Array): ServerResp|null {
+  const b=toU8(raw); if(b.length<5) return null;
+  const hs=b[0]&0xf, mt=(b[1]>>4)&0xf, fl=b[1]&0xf, sr=(b[2]>>4)&0xf, cp=b[2]&0xf;
+  let off=hs*4, isLast=(fl&0x02)!==0, ec:number|null=null, psz=0;
+  if((fl&0x01)&&off+4<=b.length){off+=4;}
+  if(mt===MT_SERVER_FULL&&off+4<=b.length){psz=r32(b,off);off+=4;}
+  else if(mt===MT_SERVER_ERR&&off+8<=b.length){ec=r32(b,off);psz=r32(b,off+4);off+=8;}
+  let p=b.slice(off);
+  if(cp===1&&p.length>0){try{p=new Uint8Array(unzipSync(p) as any);}catch{return null;}}
+  let j:ServerResp['json']|undefined;
+  if(sr===1&&p.length>0){try{j=JSON.parse(uint8ToString(p)) as ServerResp['json'];}catch{}}
+  return{mt,isLast,json:j,errorCode:ec};
+}
 
-  const hdrSize = (b[0] & 0x0f);
-  const msgType = (b[1] >> 4) & 0x0f;
-  const flags = b[1] & 0x0f;
-  const serial = (b[2] >> 4) & 0x0f;
-  const compress = b[2] & 0x0f;
-  let off = hdrSize * 4;
-  const isLast = (flags & 0x02) !== 0;
+// ─── Native Module Access (lazy to avoid crash on import) ────────
 
-  let respSeq: number | null = null;
-  if ((flags & 0x01) !== 0 && off + 4 <= b.length) {
-    respSeq = readI32BE(b, off); off += 4;
-  }
+function getHeaderWS() {
+  try { return NativeModules.HeaderWebSocket; } catch { return null; }
+}
 
-  let errCode: number | null = null;
-  let paySz = 0;
-
-  if (msgType === MT_SERVER_FULL && off + 4 <= b.length) {
-    paySz = readU32BE(b, off); off += 4;
-  } else if (msgType === MT_SERVER_ERR && off + 8 <= b.length) {
-    errCode = readI32BE(b, off); off += 4;
-    paySz = readU32BE(b, off); off += 4;
-  }
-
-  let payload = b.slice(off);
-  if (compress === 1 && payload.length > 0) {
-    try { payload = new Uint8Array(ungzip(payload)); } catch { return null; }
-  }
-
-  let json: ServerResp['json'] | undefined;
-  if (serial === 1 && payload.length > 0) {
-    try { json = JSON.parse(new TextDecoder().decode(payload)) as ServerResp['json']; } catch { /* ignore */ }
-  }
-
-  return { msgType, isLast, json, errorCode: errCode };
+function getHeaderWSEmitter() {
+  const mod = getHeaderWS();
+  return mod ? new NativeEventEmitter(mod) : null;
 }
 
 // ─── Provider ──────────────────────────────────────────────────────
 
 export class DoubaoASRProvider implements ASRProvider {
-  private ws: WebSocket | null = null;
+  private hws: any = null;
+  private subscriptions: any[] = [];
   private cfg: ASRProviderConfig | null = null;
   private handlers: ASREventHandlers | null = null;
   private seq = 1;
@@ -179,191 +122,299 @@ export class DoubaoASRProvider implements ASRProvider {
   private maxReconnects = 3;
   private rcTimer: ReturnType<typeof setTimeout> | null = null;
   private connected = false;
+  private audioFramesSent = 0;
+  private terminalErrorSeen = false;
+  private reconnecting = false;
+  private reconnectPromise: Promise<void> | null = null;
+  private endpoint = '';
+  private resourceId = '';
+  private connectionId = '';
+
+  private isBenignSocketError(message: string): boolean {
+    const normalized = message.toLowerCase();
+    return (
+      normalized.includes('socket is not connected') ||
+      normalized.includes('socket not connected') ||
+      normalized.includes('closed') ||
+      normalized.includes('not open')
+    );
+  }
 
   async initialize(cfg: ASRProviderConfig): Promise<void> {
     this.cfg = cfg;
-    log.info('DoubaoASR init (v3 binary protocol)', {
-      endpoint: cfg.endpoint || DEFAULT_ENDPOINT,
-      appId: cfg.appId?.slice(0, 4),
-      resource: (cfg.options?.['resourceId'] as string) || DEFAULT_RESOURCE_ID,
-    });
+    log.info('DoubaoASR init', { endpoint: cfg.endpoint||DEFAULT_ENDPOINT, appId: cfg.appId?.slice(0,4) });
   }
 
   async startListening(h: ASREventHandlers): Promise<void> {
     if (!this.cfg?.appId || !this.cfg?.accessToken) {
-      h.onError(new Error('Missing App ID or Access Token'));
-      return;
+      const err = new Error('Missing App ID or Access Token');
+      h.onError(err);
+      throw err; // 向上抛出，让调用者知道
     }
     this.handlers = h;
-    this.seq = 1;
-    this.interimText = '';
-    this.doneUtterances = [];
-    this.finished = false;
+    this.resetRecognitionSessionState();
     this.reconnects = 0;
 
     const ep = this.cfg.endpoint || DEFAULT_ENDPOINT;
     const rid = (this.cfg.options?.['resourceId'] as string) || DEFAULT_RESOURCE_ID;
-    const cid = uuid();
+    const cid = generateUUID();
+    this.endpoint = ep;
+    this.resourceId = rid;
+    this.connectionId = cid;
+    this.reconnecting = false;
 
-    log.info('Connecting...', ep);
+    log.info('[ASR] Connecting...', ep);
     try {
       await this.connect(ep, rid, cid);
       this.sendConfig();
-      log.info('Ready for PCM audio');
-    } catch (e) {
-      log.error('Connect failed:', e);
+      log.info('[ASR] Ready for PCM audio');
+    } catch(e) {
+      log.error('[ASR] Connect failed:', e);
       h.onError(e instanceof Error ? e : new Error(String(e)));
+      throw e; // 向上抛出
     }
   }
 
   feedPCM(data: ArrayBuffer | Uint8Array): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.finished) return;
+    if (!this.hws || !this.connected || this.finished) return;
     try {
-      this.ws.send(buildAudioFrame(data, this.seq++, false));
-    } catch (e) { log.warn('send PCM failed:', e); }
+      const frame = buildAudioFrame(data, this.seq++, false);
+      this.audioFramesSent += 1;
+      if (this.audioFramesSent === 1) {
+        log.info('[ASR] First audio frame sent');
+      }
+      this.hws.sendData(Array.from(frame)).catch(() => {});
+    } catch {}
   }
 
   async stopListening(): Promise<void> {
-    if (!this.ws) return;
-    this.finished = true;
-    log.info('Sending finish...');
+    if (!this.hws) return; this.finished = true;
+    this.reconnecting = false;
     try {
-      if (this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(buildAudioFrame(new Uint8Array(0), this.seq, true));
-        await new Promise((r) => setTimeout(r, 1500));
+      if (this.connected) {
+        this.hws.sendData(Array.from(buildAudioFrame(new Uint8Array(0), this.seq++, true))).catch(() => {});
+        await new Promise(r=>setTimeout(r,1500));
       }
-    } catch { /* ignore */ }
-    this.close();
-    log.info('Stopped. Utterances:', this.doneUtterances.length);
+    } catch{}
+    this.close(); log.info('[ASR] Stopped.');
   }
-
   async destroy(): Promise<void> { await this.stopListening(); }
+  async prepareNextTurn(): Promise<void> {
+    if (!this.hws || !this.connected || this.reconnecting) return;
+    log.info('[ASR] Proactively preparing next turn');
+    await this.reconnectCurrentSession();
+  }
 
   // ─── Internal ───────────────────────────────────────────────────
 
-  private buildAuthUrl(ep: string, rid: string, cid: string): string {
-    // RN WebSocket does not support custom HTTP headers on upgrade.
-    // Pass credentials as query parameters as fallback.
-    // Production: swap to native WS module (ThermalWS / platform SDK).
-    const url = new URL(ep);
-    url.searchParams.set('appkey', this.cfg!.appId!);
-    url.searchParams.set('access_token', this.cfg!.accessToken!);
-    url.searchParams.set('resource_id', rid);
-    url.searchParams.set('connect_id', cid);
-    url.searchParams.set('request_id', cid);
-    return url.toString();
+  /** Build HTTP headers matching official Python demo */
+  private buildHeaders(rid: string, cid: string): Record<string, string> {
+    return {
+      'X-Api-App-Key': this.cfg!.appId!,
+      'X-Api-Access-Key': this.cfg!.accessToken!,
+      'X-Api-Resource-Id': rid,
+      'X-Api-Request-Id': cid,
+    };
   }
 
-  private async connect(ep: string, rid: string, cid: string): Promise<void> {
-    const url = this.buildAuthUrl(ep, rid, cid);
+  private connect(ep: string, rid: string, cid: string): Promise<void> {
+    this.hws = getHeaderWS();
+    if (!this.hws) throw new Error('HeaderWebSocket native module not available');
+
+    const headers = this.buildHeaders(rid, cid);
+    log.info('[ASR] Headers:', Object.keys(headers).join(', '));
+
+    const emitter = getHeaderWSEmitter();
+    if (!emitter) throw new Error('HeaderWebSocket event emitter not available');
+
+    const subMsg = emitter.addListener('onMessage', (data: any) => {
+      if (data && data.type === 'binary' && Array.isArray(data.data)) {
+        this.onMessage(new Uint8Array(data.data));
+      }
+    });
+    const subErr = emitter.addListener('onError', (data: any) => {
+      const message = typeof data?.message === 'string' ? data.message : 'WS error';
+      if (this.finished || (this.isBenignSocketError(message) && !this.connected)) {
+        log.info('[ASR] Ignoring socket error during shutdown:', message);
+        return;
+      }
+      log.warn('[ASR] WS error:', message);
+      this.handlers?.onError(new Error(message));
+    });
+    const subClose = emitter.addListener('onClose', (data: any) => {
+      log.info('[ASR] WS closed:', data?.code, data?.reason);
+      this.connected = false;
+      if (!this.finished && this.reconnects < this.maxReconnects) {
+        void this.reconnect(ep, rid, cid);
+      }
+    });
+    this.subscriptions = [subMsg, subErr, subClose];
 
     return new Promise((resolve, reject) => {
-      this.ws = new WebSocket(url);
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return; settled = true;
+        reject(new Error('Timeout 10s'));
+      }, 10000);
 
-      this.ws.onopen = () => {
+      this.hws!.connect(ep, headers).then(() => {
+        if (settled) return; settled = true; clearTimeout(timer);
         this.connected = true;
+        log.info('[ASR] ✅ Connected!');
         resolve(undefined);
-      };
-
-      this.ws.onmessage = (ev: MessageEvent) => {
-        const d = ev.data instanceof ArrayBuffer
-          ? ev.data
-          : typeof ev.data === 'string'
-            ? new TextEncoder().encode(ev.data).buffer
-            : ev.data;
-        this.onMessage(new Uint8Array(d as ArrayBuffer));
-      };
-
-      this.ws.onerror = () => reject(new Error('WS error'));
-
-      this.ws.onclose = () => {
-        this.connected = false;
-        if (!this.finished && this.reconnects < this.maxReconnects) {
-          this.reconnect(ep, rid, cid);
-        }
-      };
+      }).catch((err: any) => {
+        if (settled) return; settled = true; clearTimeout(timer);
+        reject(new Error('Connect failed: ' + String(err?.message || err)));
+      });
     });
   }
 
   private sendConfig(): void {
-    if (!this.ws || !this.cfg) return;
+    if (!this.hws || !this.connected || !this.cfg) return;
     const frame = buildConfigFrame({
-      user: { uid: `mc-${uuid().slice(0, 8)}`, did: 'rn-app', platform: 'ReactNative', sdk_version: '1.0.0', app_version: '1.0.0' },
-      audio: { format: 'pcm', codec: 'raw', rate: AUDIO_SAMPLE_RATE, bits: 16, channel: 1 },
-      request: {
-        model_name: 'bigmodel',
-        enable_itn: true, enable_punc: true, enable_ddc: false,
-        show_utterances: true, result_type: 'full',
-        end_window_size: 800, force_to_speech_time: 1000,
-      },
+      user:{uid:`mc-${generateUUID().slice(0,8)}`,did:'rn-app',platform:'ReactNative',sdk_version:'1.0.0',app_version:'1.0.0'},
+      audio:{format:'pcm',codec:'raw',rate:AUDIO_SAMPLE_RATE,bits:16,channel:1},
+      request:{model_name:'bigmodel',enable_itn:true,enable_punc:true,enable_ddc:false,
+              show_utterances:true,result_type:'full',end_window_size:800,force_to_speech_time:1000},
     }, this.seq++);
-    this.ws!.send(frame.buffer ?? frame);
+    this.hws.sendData(Array.from(frame)).catch((e:any) => {
+      log.error('[ASR] Send config failed:', e);
+    });
   }
 
   private onMessage(data: Uint8Array): void {
-    const r = parseResponse(data);
-    if (!r) return;
-
-    if (r.msgType === MT_SERVER_FULL) this.onFullResp(r);
-    else if (r.msgType === MT_SERVER_ERR) this.onErrResp(r);
+    const r = parseResponse(data); if (!r) return;
+    if (this.audioFramesSent > 0 && this.audioFramesSent < 5) {
+      log.info('[ASR] Received server response type:', r.mt, 'isLast=', r.isLast);
+    }
+    if (r.mt === MT_SERVER_FULL) this.onFullResp(r);
+    else if (r.mt === MT_SERVER_ERR) this.onErrResp(r);
   }
 
   private onFullResp(r: ServerResp): void {
-    const res = r.json?.result;
-    if (!res) return;
-
-    const utts = res.utterances || [];
-    for (const u of utts.filter((u: { text?: string; definite?: boolean }) => u.definite)) {
+    const res = r.json?.result; if (!res) return;
+    for (const u of (res.utterances||[]).filter((u:any) => u.definite))
       if (u.text && !this.doneUtterances.includes(u.text)) {
         this.doneUtterances.push(u.text);
-        log.info('Final:', u.text);
+        log.info('[ASR] Final:', u.text);
         this.handlers?.onFinal(u.text, undefined);
       }
-    }
-    const interim = utts.filter((u: { text?: string; definite?: boolean }) => !u.definite);
+    const interim = (res.utterances||[]).filter((u:any) => !u.definite);
     if (interim.length > 0) {
-      const last = interim[interim.length - 1];
-      if (last.text !== this.interimText) {
-        this.interimText = last.text ?? '';
-        this.handlers?.onInterim(last.text ?? '', undefined);
+      const l = interim[interim.length - 1];
+      if (l.text !== this.interimText) {
+        this.interimText = l.text ?? '';
+        this.handlers?.onInterim(l.text ?? '', undefined);
       }
     }
-    if (res.text && utts.length === 0 && res.text !== this.interimText) {
+    if (res.text && (!res.utterances || res.utterances.length === 0) && res.text !== this.interimText) {
       this.interimText = res.text;
       this.handlers?.onInterim(res.text, undefined);
     }
-    if (r.isLast) log.info('Server last-pkg received');
+    if (r.isLast) log.info('[ASR] Last pkg received');
   }
 
   private onErrResp(r: ServerResp): void {
     const code = r.json?.error_code ?? r.errorCode ?? 0;
     const msg = r.json?.error_message ?? `ASR err ${code}`;
-    log.error('Server error:', msg);
+    const isRecoverableTurnBoundary = code === 45000081;
+
+    if (isRecoverableTurnBoundary) {
+      if (this.reconnecting || this.finished) return;
+
+      this.terminalErrorSeen = true;
+      log.info('[ASR] Turn finished, recycling recognizer session:', msg, {
+        audioFramesSent: this.audioFramesSent,
+        seq: this.seq,
+      });
+      this.reconnectCurrentSession();
+      return;
+    }
+
+    if (this.terminalErrorSeen) return;
+    this.terminalErrorSeen = true;
+    this.finished = true;
+    log.warn('[ASR] Server terminal error:', msg);
+    this.close();
     this.handlers?.onError(new Error(msg));
   }
 
-  private reconnect(ep: string, rid: string, cid: string): void {
+  private reconnect(ep: string, rid: string, cid: string): Promise<void> {
+    if (this.reconnecting) {
+      return this.reconnectPromise ?? Promise.resolve();
+    }
+    if (this.finished) {
+      return Promise.resolve();
+    }
+
+    this.reconnecting = true;
     this.reconnects++;
-    const delay = Math.min(1000 * Math.pow(2, this.reconnects - 1), 10000);
-    log.warn(`Reconnect in ${delay}ms (${this.reconnects}/${this.maxReconnects})`);
-    this.rcTimer = setTimeout(async () => {
-      try {
-        await this.connect(ep, rid, uuid());
-        this.sendConfig();
-        log.info('Reconnected');
-        this.reconnects = 0;
-      } catch (e) {
-        log.error('Reconnect fail:', e);
-        if (this.reconnects < this.maxReconnects) this.reconnect(ep, rid, cid);
-        else this.handlers?.onError(new Error('Reconnect exhausted'));
-      }
-    }, delay);
+    const d = Math.min(1000 * Math.pow(2, this.reconnects - 1), 10000);
+    log.warn(`[ASR] Reconnect ${d}ms (${this.reconnects}/${this.maxReconnects})`);
+    this.reconnectPromise = new Promise((resolve, reject) => {
+      this.rcTimer = setTimeout(async () => {
+        try {
+          const nextConnectionId = generateUUID();
+          this.connectionId = nextConnectionId;
+          await this.connect(ep, rid, nextConnectionId);
+          this.sendConfig();
+          log.info('[ASR] Reconnected');
+          this.reconnects = 0;
+          this.reconnecting = false;
+          this.terminalErrorSeen = false;
+          this.reconnectPromise = null;
+          resolve();
+        } catch(e) {
+          log.error('[ASR] Recon fail:', e);
+          this.reconnecting = false;
+          this.close();
+          if (this.reconnects < this.maxReconnects) {
+            this.reconnectPromise = null;
+            try {
+              await this.reconnect(ep, rid, cid);
+              resolve();
+            } catch (retryError) {
+              reject(retryError);
+            }
+          } else {
+            this.reconnectPromise = null;
+            const error = new Error('Recon exhausted');
+            this.handlers?.onError(error);
+            reject(error);
+          }
+        }
+      }, d);
+    });
+
+    return this.reconnectPromise;
+  }
+
+  private reconnectCurrentSession(): Promise<void> {
+    this.close();
+    if (!this.endpoint || !this.resourceId || !this.connectionId) {
+      return Promise.resolve();
+    }
+    this.resetRecognitionSessionState();
+    return this.reconnect(this.endpoint, this.resourceId, this.connectionId);
+  }
+
+  private resetRecognitionSessionState(): void {
+    this.seq = 1;
+    this.finished = false;
+    this.connected = false;
+    this.interimText = '';
+    this.doneUtterances = [];
+    this.audioFramesSent = 0;
+    this.terminalErrorSeen = false;
   }
 
   private close(): void {
+    if (this.subscriptions) {
+      for (const s of this.subscriptions) { try { s.remove(); } catch {} }
+      this.subscriptions = [];
+    }
     if (this.rcTimer) { clearTimeout(this.rcTimer); this.rcTimer = null; }
-    if (this.ws) { try { this.ws.close(); } catch { /* */ } this.ws = null; }
+    if (this.hws) { try { this.hws.close().catch(()=>{}); } catch {} this.hws = null; }
     this.connected = false;
-    this.finished = false;
   }
 }

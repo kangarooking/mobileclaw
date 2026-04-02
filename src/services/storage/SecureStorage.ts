@@ -13,7 +13,8 @@
 import * as SecureStore from 'expo-secure-store';
 
 /** Service name used as the Keychain account / Android pref key prefix */
-const SERVICE = 'com.mobileclaw.keystore';
+// NOTE: Must only contain [a-zA-Z0-9._-] — no colons or other special chars (iOS Keychain restriction)
+const SERVICE = 'mobileclaw';
 
 /**
  * SecureStorage — Static utility class for secure key-value storage.
@@ -98,14 +99,48 @@ export class SecureStorage {
     return this.getItem('tts_api_key');
   }
 
-  // ─── Device Identity (Ed25519 Keypair) ─────────────────────────
-
-  /** Store Ed25519 private key PEM (HIGHLY SENSITIVE) */
-  static async setDevicePrivateKey(pem: string): Promise<void> {
-    return this.setItem('device_private_key', pem);
+  static async setTTSAppId(appId: string): Promise<void> {
+    return this.setItem('tts_app_id', appId);
   }
 
-  /** Retrieve Ed25519 private key PEM */
+  static async getTTSAppId(): Promise<string | null> {
+    return this.getItem('tts_app_id');
+  }
+
+  static async setTTSAccessToken(token: string): Promise<void> {
+    return this.setItem('tts_access_token', token);
+  }
+
+  static async getTTSAccessToken(): Promise<string | null> {
+    return this.getItem('tts_access_token');
+  }
+
+  static async setTTSSecretKey(secret: string): Promise<void> {
+    return this.setItem('tts_secret_key', secret);
+  }
+
+  static async getTTSSecretKey(): Promise<string | null> {
+    return this.getItem('tts_secret_key');
+  }
+
+  // ─── Vision Intent Model Credentials ─────────────────────────────
+
+  static async setVisionApiKey(key: string): Promise<void> {
+    return this.setItem('vision_api_key', key);
+  }
+
+  static async getVisionApiKey(): Promise<string | null> {
+    return this.getItem('vision_api_key');
+  }
+
+  // ─── Device Identity (Ed25519 Keypair) ─────────────────────────
+
+  /** Store Ed25519 private seed / private material (HIGHLY SENSITIVE) */
+  static async setDevicePrivateKey(value: string): Promise<void> {
+    return this.setItem('device_private_key', value);
+  }
+
+  /** Retrieve Ed25519 private seed / private material */
   static async getDevicePrivateKey(): Promise<string | null> {
     return this.getItem('device_private_key');
   }
@@ -137,6 +172,6 @@ export class SecureStorage {
    * Format: "service:key"
    */
   private static namespacedKey(key: string): string {
-    return `${SERVICE}:${key}`;
+    return `${SERVICE}.${key}`;
   }
 }

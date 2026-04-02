@@ -15,6 +15,8 @@ import { Audio } from 'expo-av';
 import type { TTSProvider, TTSEventHandlers } from '../TTSService';
 import type { TTSProviderConfig } from '@/types/config';
 import { getLogger } from '@/utils/logger';
+import { uint8ToBase64 } from '@/utils/rnCompat';
+import * as FileSystem from 'expo-file-system/legacy';
 
 const log = getLogger('EdgeTTS');
 
@@ -162,10 +164,13 @@ export class EdgeTTSProvider implements TTSProvider {
     // Stop any existing playback
     await this.stop();
 
-    // Create temp file URI from ArrayBuffer
-    // expo-av Sound requires a URI, so we write to a temp location
-    const base64 = this.arrayBufferToBase64(audioData);
-    const uri = `data:audio/mp3;base64,${base64}`;
+    // Write to temp file (data: URI unreliable in expo-av on iOS)
+    const base64 = uint8ToBase64(new Uint8Array(audioData));
+    const tempPath = FileSystem.cacheDirectory + 'tts_edge.mp3';
+    await FileSystem.writeAsStringAsync(tempPath, base64, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+    const uri = tempPath;
 
     try {
       const { sound } = await Audio.Sound.createAsync(
@@ -206,13 +211,6 @@ export class EdgeTTSProvider implements TTSProvider {
 
   /** Convert ArrayBuffer to base64 string */
   private arrayBufferToBase64(buffer: ArrayBuffer): string {
-    const bytes = new Uint8Array(buffer);
-    let binary = '';
-    const CHUNK_SIZE = 8192;
-    for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
-      const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, bytes.length));
-      binary += String.fromCharCode(...chunk);
-    }
-    return btoa(binary);
+    return uint8ToBase64(new Uint8Array(buffer));
   }
 }

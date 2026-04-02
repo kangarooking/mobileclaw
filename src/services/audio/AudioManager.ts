@@ -46,17 +46,33 @@ export class AudioManager {
 
     log.info('Configuring audio session...', Platform.OS);
 
-    await Audio.setAudioModeAsync({
-      allowsRecordingIOS: cfg.allowsRecordingIOS ?? true,
-      playsInSilentModeIOS: cfg.playsInSilentModeIOS ?? true,
-      staysActiveInBackground: false,
-      interruptionModeIOS: cfg.interruptionModeIOS ?? 1, // DoNotMix
-      shouldDuckAndroid: cfg.shouldDuckAndroid ?? true,
-      interruptionModeAndroid: cfg.interruptionModeAndroid ?? 1, // DoNotMix
-    } as any); // Cast to satisfy v16 type checking
+    // Retry up to 3 times — iOS may briefly put app in background during
+    // permission dialogs (camera/mic), causing "experience in background" error.
+    const MAX_RETRIES = 3;
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: cfg.allowsRecordingIOS ?? true,
+          playsInSilentModeIOS: cfg.playsInSilentModeIOS ?? true,
+          staysActiveInBackground: false,
+          interruptionModeIOS: cfg.interruptionModeIOS ?? 1, // DoNotMix
+          shouldDuckAndroid: cfg.shouldDuckAndroid ?? true,
+          interruptionModeAndroid: cfg.interruptionModeAndroid ?? 1, // DoNotMix
+        } as any); // Cast to satisfy v16 type checking
 
-    this.configured = true;
-    log.info('Audio session configured successfully');
+        this.configured = true;
+        log.info('Audio session configured successfully');
+        return;
+      } catch (err: any) {
+        const msg = err?.message || '';
+        if (msg.includes('background') && attempt < MAX_RETRIES - 1) {
+          log.warn(`Audio session in background (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in 500ms...`);
+          await new Promise((r) => setTimeout(r, 500));
+          continue;
+        }
+        throw err;
+      }
+    }
   }
 
   isConfigured(): boolean {
@@ -64,7 +80,24 @@ export class AudioManager {
   }
 
   /**
-   * Start PCM audio recording.
+   * Request microphone permission without starting a second recorder.
+   */
+  async ensureMicrophonePermission(): Promise<void> {
+    const permission = await Audio.requestPermissionsAsync();
+    log.info('Mic permission result:', permission.status);
+    if (permission.status !== 'granted') {
+      const { Alert } = require('react-native');
+      Alert.alert(
+        '需要麦克风权限',
+        '请在设置中允许 MobileClaw 访问麦克风，否则无法进行语音识别。\n\n设置 → 隐私 → 麦克风',
+        [{ text: '知道了' }]
+      );
+      throw new Error(`Microphone permission ${permission.status}`);
+    }
+  }
+
+  /**
+   * Start expo-av recording for local metering-only scenarios.
    */
   async startRecording(): Promise<Audio.Recording> {
     if (this.isRecording) {
@@ -75,10 +108,7 @@ export class AudioManager {
     log.info('Starting audio recording...');
 
     try {
-      const permission = await Audio.requestPermissionsAsync();
-      if (permission.status !== 'granted') {
-        throw new Error('Microphone permission denied');
-      }
+      await this.ensureMicrophonePermission();
 
       const recording = new Audio.Recording();
       await recording.prepareToRecordAsync(Audio.RecordingOptionsPresets.HighQuality);
@@ -132,6 +162,11 @@ export class AudioManager {
   onVolumeUpdate(listener: (level: number) => void): () => void {
     this.volumeListeners.add(listener);
     return () => this.volumeListeners.delete(listener);
+  }
+
+  emitVolumeLevel(level: number): void {
+    const normalized = Math.max(0, Math.min(1, level));
+    this.volumeListeners.forEach((fn) => fn(normalized));
   }
 
   // ─── Internal: Volume Monitoring ───────────────────────────────────

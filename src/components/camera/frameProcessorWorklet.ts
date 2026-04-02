@@ -17,6 +17,23 @@ import type { Frame } from 'react-native-vision-camera';
 
 // ─── Configuration ────────────────────────────────────────────────
 
+/**
+ * Manual base64 encoding for worklet thread (btoa not available).
+ * Inline implementation — no imports needed.
+ */
+function uint8ToBase64Worklet(bytes: Uint8Array): string {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let result = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i], b1 = bytes[i + 1], b2 = bytes[i + 2];
+    result += chars[b0 >> 2];
+    result += chars[((b0 & 3) << 4) | ((b1 ?? 0) >> 4)];
+    result += (i + 1 < bytes.length) ? chars[((b1 & 15) << 2) | ((b2 ?? 0) >> 6)] : '=';
+    result += (i + 2 < bytes.length) ? chars[b2 & 63] : '=';
+  }
+  return result;
+}
+
 /** Throttle: only send a frame if >67ms elapsed since last (~15fps) */
 const THROTTLE_MS = 67;
 
@@ -84,16 +101,8 @@ export function processFrame(frame: Frame): void {
     const bytes = new Uint8Array(buffer);
 
     // Convert to base64 string for transmission
-    // TODO: Replace with JPEG encoding via native Frame Processor Plugin
-    //       for ~10x size reduction. Raw base64 of 640x480 ≈ 600KB vs JPEG ≈ 30KB
-    let binary = '';
-    // Chunk to avoid stack overflow on large frames
-    const CHUNK_SIZE = 8192;
-    for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
-      const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, bytes.length));
-      binary += String.fromCharCode(...chunk);
-    }
-    const base64 = btoa(binary);
+    // Manual base64 encoding (btoa not available in worklet thread)
+    const base64 = uint8ToBase64Worklet(bytes);
 
     const { width, height } = frame;
 

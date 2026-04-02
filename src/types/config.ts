@@ -41,8 +41,14 @@ export interface TTSProviderConfig {
   apiKey?: string;                 // Stored in SecureStorage (legacy / non-Doubao providers)
   appId?: string;                 // Volcengine App ID (Doubao TTS)
   accessToken?: string;           // Volcengine Access Token (Doubao TTS)
+  secretKey?: string;             // Volcengine Secret Key (optional for future/native flows)
   endpoint?: string;
-  voiceId?: string;
+  address?: string;               // e.g. wss://openspeech.bytedance.com
+  uri?: string;                   // e.g. /api/v3/tts/bidirection
+  cluster?: string;               // Legacy field from old Doubao TTS path
+  resourceId?: string;            // BiTTS 2.0 source/resource id, e.g. seed-tts-2.0
+  voiceId?: string;               // Optional instance/display name
+  voiceType?: string;             // BiTTS 2.0 speaker
   language: string;
   speed?: number;                  // 0.5 - 2.0
   options?: Record<string, unknown>;
@@ -65,6 +71,13 @@ export interface VideoConfig {
   resolution: VideoResolution;
   fps: number;
   jpegQuality: number;             // 0.3 - 1.0
+  visionMode: 'auto' | 'off' | 'force';
+  speechFrameMaxCount: number;
+  replyTimeoutMs: number;
+  bufferWindowMs: number;
+  preRollMs: number;
+  postRollMs: number;
+  bufferFps: number;
 }
 
 // ─── Top-Level App Configuration ─────────────────────────────────────
@@ -93,7 +106,12 @@ export const DEFAULT_CONFIG: AppConfig = {
     language: 'zh-CN',
   },
   tts: {
-    type: 'edge',                  // Default to free Edge TTS
+    type: 'doubao',
+    address: 'wss://openspeech.bytedance.com',
+    uri: '/api/v3/tts/bidirection',
+    resourceId: 'seed-tts-2.0',
+    voiceId: 'TTS-SeedTTS2.02000000687609518146',
+    voiceType: 'zh_female_vv_uranus_bigtts',
     language: 'zh-CN',
     speed: 1.0,
   },
@@ -106,6 +124,13 @@ export const DEFAULT_CONFIG: AppConfig = {
     resolution: '640x480',
     fps: 15,
     jpegQuality: 0.7,
+    visionMode: 'auto',
+    speechFrameMaxCount: 7,
+    replyTimeoutMs: 90_000,
+    bufferWindowMs: 4_000,
+    preRollMs: 500,
+    postRollMs: 300,
+    bufferFps: 4,
   },
   advanced: {
     debugMode: false,

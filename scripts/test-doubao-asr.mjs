@@ -17,10 +17,14 @@ import WebSocket from 'ws';
 
 // ─── Configuration ──────────────────────────────────────────────
 
-const APP_ID = process.env.DOUBAO_APP_ID || '7628583300';
-const ACCESS_TOKEN = process.env.DOUBAO_ACCESS_TOKEN || 'P928EjcKlfMe4Zt07pwaapzvs8V9zdGO';
+const APP_ID = process.env.DOUBAO_APP_ID;
+const ACCESS_TOKEN = process.env.DOUBAO_ACCESS_TOKEN;
 const RESOURCE_ID = 'volc.bigasr.sauc.duration';
 const ENDPOINT = process.env.DOUBAO_ENDPOINT || 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async';
+
+if (!APP_ID || !ACCESS_TOKEN) {
+  throw new Error('Missing DOUBAO_APP_ID or DOUBAO_ACCESS_TOKEN');
+}
 
 let passed = 0;
 let failed = 0;

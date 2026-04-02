@@ -20,24 +20,35 @@ export function ChatLogList({
   return (
     <ScrollView
       style={{ flex: 1 }}
-      contentContainerStyle={{ padding: 12, gap: 8 }}
+      contentContainerStyle={{ paddingHorizontal: 12, paddingBottom: 14, paddingTop: 8, gap: 10 }}
       showsVerticalScrollIndicator={false}
     >
-      {/* Historical messages */}
       {messages.map((msg) =>
         msg.role === 'user' ? (
-          <TranscriptBubble key={msg.id} text={msg.content} />
+          <TranscriptBubble
+            key={msg.id}
+            text={msg.content}
+            footerLabel={
+              msg.visionIntent === 'unknown'
+                ? '等待视觉判定'
+                : msg.hasVideoContext
+                  ? `视觉 · ${msg.visionFrameCount ?? 0} 帧`
+                  : '仅文本'
+            }
+          />
         ) : (
-          <ResponseBubble key={msg.id} text={msg.content} />
+          <ResponseBubble
+            key={msg.id}
+            text={msg.content}
+            footerLabel={msg.hasVideoContext ? '基于视觉上下文回复' : '回复'}
+          />
         ),
       )}
 
-      {/* Live transcript (current user speech) */}
       {currentTranscript ? (
-        <TranscriptBubble text={currentTranscript} isLive />
+        <TranscriptBubble text={currentTranscript} isLive footerLabel="实时转写" />
       ) : null}
 
-      {/* Current AI response */}
       {aiResponseText ? (
         <ResponseBubble text={aiResponseText} isSpeaking={isTTSSpeaking} />
       ) : null}

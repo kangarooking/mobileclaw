@@ -10,6 +10,8 @@ export interface ChatMessage {
   content: string;
   timestamp: number;
   hasVideoContext: boolean;
+  visionIntent?: 'unknown' | 'needed' | 'skipped';
+  visionFrameCount?: number;
   transcript?: string;            // Original ASR text (for user messages)
   audioDurationMs?: number;
 }
@@ -17,6 +19,9 @@ export interface ChatMessage {
 // ─── Session Mode ────────────────────────────────────────────────────
 
 export type SessionMode = 'idle' | 'waking' | 'active';
+
+export type VisionMode = 'auto' | 'off' | 'force';
+export type VisionIntentStatus = 'unknown' | 'needed' | 'skipped';
 
 // ─── Connection Status ───────────────────────────────────────────────
 
@@ -42,6 +47,15 @@ export interface SessionState {
   // Media streams
   isCameraActive: boolean;
   isMicActive: boolean;
+  cameraPreviewVisible: boolean;
+
+  // Vision
+  visionMode: VisionMode;
+  visionIntent: VisionIntentStatus;
+  isAnalyzingVision: boolean;
+  selectedFrameCount: number;
+  speechStartAt: number | null;
+  speechEndAt: number | null;
 
   // Conversation
   messages: ChatMessage[];

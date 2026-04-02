@@ -1,208 +1,182 @@
 /**
- * DoubaoTTSProvider — 火山引擎/豆包 TTS 合成
+ * DoubaoTTSProvider — iOS native SpeechEngine bridge for 豆包/火山 TTS
  *
- * Uses Volcengine (火山引擎) TTS REST API for speech synthesis.
- * Requires API key configured in Settings.
- *
- * Reference: https://www.volcengine.com/docs/6561/79814
+ * This follows the official iOS SDK path instead of the previous ad-hoc
+ * HTTP call. The native bridge owns the SpeechEngine lifecycle and playback.
  */
 
-import { Audio } from 'expo-av';
+import { NativeEventEmitter, NativeModules, type EmitterSubscription } from 'react-native';
 import type { TTSProvider, TTSEventHandlers } from '../TTSService';
 import type { TTSProviderConfig } from '@/types/config';
 import { getLogger } from '@/utils/logger';
 
 const log = getLogger('DoubaoTTS');
+const nativeBridge = NativeModules.HeaderWebSocket;
+const nativeEmitter = nativeBridge ? new NativeEventEmitter(nativeBridge) : null;
 
-/** Default Volcengine TTS endpoint */
-const DEFAULT_ENDPOINT = 'https://openspeech.bytedance.com/api/v1/tts';
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 export class DoubaoTTSProvider implements TTSProvider {
   private config: TTSProviderConfig | null = null;
-  private sound: Audio.Sound | null = null;
+  private statusSub: EmitterSubscription | null = null;
+  private errorSub: EmitterSubscription | null = null;
+  private pendingResolve: (() => void) | null = null;
+  private pendingReject: ((error: Error) => void) | null = null;
+  private pendingHandlers: TTSEventHandlers | null = null;
+  private hasStartedPlayback = false;
 
   async initialize(config: TTSProviderConfig): Promise<void> {
-    this.config = config;
+    if (!nativeBridge?.initializeDoubaoTTS || !nativeBridge?.speakDoubaoTTS) {
+      throw new Error('Doubao native TTS bridge is not available on this platform');
+    }
+
+    const nextConfig: TTSProviderConfig = { ...config };
+    nextConfig.address ||= 'wss://openspeech.bytedance.com';
+    nextConfig.uri ||= '/api/v3/tts/bidirection';
+    nextConfig.resourceId ||= 'seed-tts-2.0';
+    nextConfig.voiceId ||= 'TTS-SeedTTS2.02000000687609518146';
+    nextConfig.voiceType ||= 'zh_female_vv_uranus_bigtts';
+    nextConfig.language ||= 'zh-CN';
+    nextConfig.speed ??= 1.0;
+
+    if (!nextConfig.appId || !nextConfig.accessToken) {
+      throw new Error('Doubao TTS credentials are missing. Please configure them in Settings.');
+    }
+
+    this.ensureListeners();
+
+    try {
+      await nativeBridge.initializeDoubaoTTS({
+        appId: nextConfig.appId,
+        accessToken: nextConfig.accessToken,
+        address: nextConfig.address,
+        uri: nextConfig.uri,
+        resourceId: nextConfig.resourceId,
+        voiceId: nextConfig.voiceId,
+        voiceType: nextConfig.voiceType,
+        language: nextConfig.language,
+        speed: nextConfig.speed ?? 1.0,
+        options: nextConfig.options,
+      });
+    } catch (error) {
+      this.config = null;
+      throw error;
+    }
+
+    this.config = nextConfig;
+
     log.info('DoubaoTTS initialized:', {
-      endpoint: config.endpoint || DEFAULT_ENDPOINT,
-      voiceId: config.voiceId,
-      language: config.language,
-      speed: config.speed ?? 1.0,
+      resourceId: nextConfig.resourceId,
+      instanceName: nextConfig.voiceId,
+      voiceId: nextConfig.voiceId,
+      speaker: nextConfig.voiceType,
+      language: nextConfig.language,
+      speed: nextConfig.speed ?? 1.0,
     });
   }
 
-  /**
-   * Synthesize speech via Doubao TTS API and play it.
-   */
   async speak(text: string, handlers?: TTSEventHandlers): Promise<void> {
     if (!text.trim()) return;
-    const hasCredentials = this.config?.appId && this.config?.accessToken;
-    if (!hasCredentials && !this.config?.apiKey) {
-      handlers?.onError?.(new Error('Doubao TTS credentials not configured (need App ID + Access Token)'));
-      return;
+    if (!this.config) {
+      throw new Error('Doubao TTS not initialized');
     }
 
-    log.info('DoubaoTTS speaking:', text.slice(0, 60));
-    handlers?.onStart?.();
+    this.ensureListeners();
+    await this.stop();
 
-    try {
-      const audioData = await this.synthesize(text);
-      if (!audioData) {
-        throw new Error('No audio data received from Doubao TTS');
+    this.pendingHandlers = handlers || null;
+    this.hasStartedPlayback = false;
+
+    return new Promise<void>(async (resolve, reject) => {
+      this.pendingResolve = resolve;
+      this.pendingReject = reject;
+
+      try {
+        log.info('DoubaoTTS speaking:', text.slice(0, 60));
+        await nativeBridge.speakDoubaoTTS(text);
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(getErrorMessage(error));
+        this.rejectPending(err);
       }
-
-      await this.playAudio(audioData);
-      handlers?.onDone?.();
-
-    } catch (error) {
-      log.error('DoubaoTTS speak failed:', error);
-      handlers?.onError?.(error instanceof Error ? error : new Error(String(error)));
-    }
+    });
   }
 
   async stop(): Promise<void> {
-    if (this.sound) {
-      try {
-        await this.sound.stopAsync();
-        await this.sound.unloadAsync();
-      } catch {
-        // Ignore cleanup errors
-      }
-      this.sound = null;
+    try {
+      await nativeBridge?.stopDoubaoTTS?.();
+    } catch (error) {
+      log.warn('DoubaoTTS stop failed:', getErrorMessage(error));
     }
-    log.info('DoubaoTTS stopped');
+    this.clearPending();
   }
 
   async destroy(): Promise<void> {
     await this.stop();
+    try {
+      await nativeBridge?.destroyDoubaoTTS?.();
+    } catch (error) {
+      log.warn('DoubaoTTS destroy failed:', getErrorMessage(error));
+    }
+    this.removeListeners();
+    this.config = null;
   }
 
-  // ─── Internal ─────────────────────────────────────────────────────
+  private ensureListeners(): void {
+    if (!nativeEmitter) {
+      throw new Error('Doubao native TTS event emitter is not available');
+    }
+    if (!this.statusSub) {
+      this.statusSub = nativeEmitter.addListener('onTTSStatus', (event: { status?: string }) => {
+        const status = event?.status || 'unknown';
+        log.info('DoubaoTTS native status:', status);
 
-  private async synthesize(text: string): Promise<ArrayBuffer | null> {
-    const endpoint = this.config?.endpoint || DEFAULT_ENDPOINT;
-    // Use dedicated Doubao credentials, fallback to generic apiKey
-    const appId = this.config?.appId || this.config?.apiKey || '';
-    const token = this.config?.accessToken || this.config?.options?.['token' as string] || this.config?.apiKey || '';
-
-    try {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          app: {
-            appid: appId,
-            token: token,
-            cluster: 'volcengine_streaming_common',
-          },
-          user: {
-            uid: 'mobileclaw-ios',
-          },
-          audio: {
-            voice_type: this.config?.voiceId || 'zh_female_wanwan_moon_bigtts',
-            language: this.config?.language || 'zh-CN',
-            speed: this.config?.speed ?? 1.0,
-            encoding: 'mp3',
-            volume_ratio: 1.0,
-            pitch_ratio: 1.0,
-          },
-          request: {
-            reqid: `tts-${Date.now()}`,
-            text,
-            operation: 'query',
-            text_type: 'plain',
-            with_frontend: true,
-          },
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`Doubao TTS error: ${response.status} ${response.statusText}`);
-      }
-
-      // Response may be JSON (with audio URL) or binary audio data
-      const contentType = response.headers.get('content-type') || '';
-
-      if (contentType.includes('json')) {
-        // JSON response — extract audio URL or base64 data
-        const json = await response.json();
-        if (json.data) {
-          // Base64-encoded audio in response
-          if (typeof json.data === 'string') {
-            return this.base64ToArrayBuffer(json.data);
-          }
-          // URL to audio file
-          if (typeof json.data === 'string' && json.data.startsWith('http')) {
-            const audioResp = await fetch(json.data);
-            return audioResp.arrayBuffer();
-          }
+        if (status === 'playing' && !this.hasStartedPlayback) {
+          this.hasStartedPlayback = true;
+          this.pendingHandlers?.onStart?.();
         }
-        log.warn('Unexpected TTS JSON response:', JSON.stringify(json).slice(0, 200));
-        return null;
-      }
 
-      // Binary audio response
-      return response.arrayBuffer();
-
-    } catch (error) {
-      log.error('Doubao TTS synthesis failed:', error);
-      return null;
-    }
-  }
-
-  private async playAudio(audioData: ArrayBuffer): Promise<void> {
-    await this.stop();
-
-    const base64 = this.arrayBufferToBase64(audioData);
-    const uri = `data:audio/mp3;base64,${base64}`;
-
-    try {
-      const { sound } = await Audio.Sound.createAsync(
-        { uri },
-        { shouldPlay: true },
-      );
-
-      this.sound = sound;
-
-      return new Promise((resolve) => {
-        sound.setOnPlaybackStatusUpdate?.((status) => {
-          if (status.isLoaded && status.didJustFinish) {
-            sound.unloadAsync().catch(() => {});
-            this.sound = null;
-            resolve(undefined);
-          }
-        });
-
-        setTimeout(() => {
-          this.stop().then(resolve).catch(() => resolve());
-        }, 30_000);
+        if (status === 'finished' || status === 'stopped') {
+          this.pendingHandlers?.onDone?.();
+          this.resolvePending();
+        }
       });
+    }
 
-    } catch (error) {
-      log.error('Audio playback failed:', error);
-      throw error;
+    if (!this.errorSub) {
+      this.errorSub = nativeEmitter.addListener('onTTSError', (event: { message?: string; code?: number }) => {
+        const err = new Error(event?.message || 'Native Doubao TTS failed');
+        log.warn('DoubaoTTS native error:', event?.code, err.message);
+        this.rejectPending(err);
+      });
     }
   }
 
-  private arrayBufferToBase64(buffer: ArrayBuffer): string {
-    const bytes = new Uint8Array(buffer);
-    let binary = '';
-    const CHUNK_SIZE = 8192;
-    for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
-      const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, bytes.length));
-      binary += String.fromCharCode(...chunk);
-    }
-    return btoa(binary);
+  private removeListeners(): void {
+    this.statusSub?.remove();
+    this.statusSub = null;
+    this.errorSub?.remove();
+    this.errorSub = null;
   }
 
-  private base64ToArrayBuffer(base64: string): ArrayBuffer {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes.buffer as ArrayBuffer;
+  private resolvePending(): void {
+    const resolve = this.pendingResolve;
+    this.clearPending();
+    resolve?.();
+  }
+
+  private rejectPending(error: Error): void {
+    const reject = this.pendingReject;
+    this.pendingHandlers?.onError?.(error);
+    this.clearPending();
+    reject?.(error);
+  }
+
+  private clearPending(): void {
+    this.pendingResolve = null;
+    this.pendingReject = null;
+    this.pendingHandlers = null;
+    this.hasStartedPlayback = false;
   }
 }

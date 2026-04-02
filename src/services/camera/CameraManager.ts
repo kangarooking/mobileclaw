@@ -7,6 +7,7 @@
 
 import { Camera } from 'react-native-vision-camera';
 import { getLogger } from '@/utils/logger';
+import { visualFrameBuffer } from './VisualFrameBuffer';
 
 const log = getLogger('CameraManager');
 
@@ -60,7 +61,18 @@ export class CameraManager {
     this.latestFrameTimestamp = timestamp;
     this.latestFrameWidth = width;
     this.latestFrameHeight = height;
+    visualFrameBuffer.push({
+      id: `vf_${timestamp}_${Math.random().toString(36).slice(2, 8)}`,
+      base64: dataBase64,
+      width,
+      height,
+      timestamp,
+    });
     this.onFrameReady?.(dataBase64, width, height, timestamp);
+  }
+
+  clearBufferedFrames(): void {
+    visualFrameBuffer.clear();
   }
 }
 

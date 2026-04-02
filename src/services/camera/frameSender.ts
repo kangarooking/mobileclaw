@@ -7,6 +7,7 @@
 
 import type { GatewayClient } from '../gateway/GatewayClient';
 import { cameraManager } from './CameraManager';
+import type { BufferedVisualFrame } from './VisualFrameBuffer';
 import { useSessionStore } from '@/store/useSessionStore';
 import { getLogger } from '@/utils/logger';
 import {
@@ -47,6 +48,21 @@ export class FrameSender {
       content: frame,
       meta: { w, h },
     };
+  }
+
+  getFrameAttachments(frames: BufferedVisualFrame[]): Array<Record<string, unknown>> {
+    return frames.map((frame, index) => ({
+      type: 'image',
+      mimeType: 'image/jpeg',
+      fileName: `speech_frame_${index + 1}.jpg`,
+      content: frame.base64,
+      meta: {
+        w: frame.width,
+        h: frame.height,
+        index,
+        timestamp: frame.timestamp,
+      },
+    }));
   }
 
   /**

@@ -8,6 +8,7 @@ import { HomeScreen } from '@/screens/HomeScreen';
 import { SessionScreen } from '@/screens/SessionScreen';
 import { SettingsScreen } from '@/screens/SettingsScreen';
 import { urlSchemeHandler } from '@/services/wake/UrlSchemeHandler';
+import { useAppStore } from '@/store/useAppStore';
 
 export type RootStackParamList = {
   Home: undefined;
@@ -19,10 +20,13 @@ const Stack = createNativeStackNavigator<RootStackParamList>();
 
 export default function App() {
   // Initialize URL scheme handler on mount (handles mobileclaw://activate links)
+  // Load persisted config from AsyncStorage
+  const { loadConfig } = useAppStore();
   useEffect(() => {
     urlSchemeHandler.initialize().catch((err) => {
       console.warn('[App] URL scheme handler init failed:', err);
     });
+    loadConfig(); // Restore saved gateways, ASR config, etc.
   }, []);
 
   return (

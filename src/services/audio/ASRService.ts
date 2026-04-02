@@ -23,6 +23,7 @@ export interface ASRProvider {
   startListening(handlers: ASREventHandlers): Promise<void>;
   stopListening(): Promise<void>;
   destroy(): Promise<void>;
+  prepareNextTurn?(): Promise<void>;
   /** Feed PCM audio data (for providers that accept external audio input) */
   feedPCM?(data: ArrayBuffer | Uint8Array): void;
 }
@@ -78,6 +79,11 @@ export class ASRService {
     this.isListening = false;
     await this.provider.stopListening();
     log.info('ASR stopped listening');
+  }
+
+  async prepareNextTurn(): Promise<void> {
+    if (!this.provider || !this.isListening || !this.provider.prepareNextTurn) return;
+    await this.provider.prepareNextTurn();
   }
 
   getIsListening(): boolean {

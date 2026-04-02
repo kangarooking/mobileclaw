@@ -3,8 +3,10 @@ import type {
   SessionMode,
   ConnectionStatus,
   ChatMessage,
+  VisionMode,
+  VisionIntentStatus,
 } from '@/types/session';
-import { v4 as uuid } from 'uuid';
+import { generateUUID } from '@/utils/rnCompat';
 
 interface SessionStateStore {
   // Session identity
@@ -22,12 +24,30 @@ interface SessionStateStore {
   // Media streams
   isCameraActive: boolean;
   isMicActive: boolean;
+  cameraPreviewVisible: boolean;
   setIsCameraActive: (v: boolean) => void;
   setIsMicActive: (v: boolean) => void;
+  setCameraPreviewVisible: (v: boolean) => void;
+
+  // Vision
+  visionMode: VisionMode;
+  setVisionMode: (mode: VisionMode) => void;
+  visionIntent: VisionIntentStatus;
+  setVisionIntent: (status: VisionIntentStatus) => void;
+  isAnalyzingVision: boolean;
+  setIsAnalyzingVision: (v: boolean) => void;
+  selectedFrameCount: number;
+  setSelectedFrameCount: (count: number) => void;
+  speechStartAt: number | null;
+  speechEndAt: number | null;
+  markSpeechStart: (timestamp?: number) => void;
+  markSpeechEnd: (timestamp?: number) => void;
+  resetSpeechWindow: () => void;
 
   // Conversation
   messages: ChatMessage[];
   addMessage: (msg: ChatMessage) => void;
+  updateMessage: (id: string, patch: Partial<ChatMessage>) => void;
   clearMessages: () => void;
 
   currentTranscript: string;
@@ -67,12 +87,34 @@ export const useSessionStore = create<SessionStateStore>((set, get) => ({
 
   isCameraActive: false,
   isMicActive: false,
+  cameraPreviewVisible: false,
   setIsCameraActive: (v) => set({ isCameraActive: v }),
   setIsMicActive: (v) => set({ isMicActive: v }),
+  setCameraPreviewVisible: (v) => set({ cameraPreviewVisible: v }),
+
+  visionMode: 'auto',
+  setVisionMode: (visionMode) => set({ visionMode }),
+  visionIntent: 'unknown',
+  setVisionIntent: (visionIntent) => set({ visionIntent }),
+  isAnalyzingVision: false,
+  setIsAnalyzingVision: (isAnalyzingVision) => set({ isAnalyzingVision }),
+  selectedFrameCount: 0,
+  setSelectedFrameCount: (selectedFrameCount) => set({ selectedFrameCount }),
+  speechStartAt: null,
+  speechEndAt: null,
+  markSpeechStart: (timestamp = Date.now()) => set({ speechStartAt: timestamp }),
+  markSpeechEnd: (timestamp = Date.now()) => set({ speechEndAt: timestamp }),
+  resetSpeechWindow: () => set({ speechStartAt: null, speechEndAt: null }),
 
   messages: [],
   addMessage: (msg) =>
     set((state) => ({ messages: [...state.messages, msg] })),
+  updateMessage: (id, patch) =>
+    set((state) => ({
+      messages: state.messages.map((msg) =>
+        msg.id === id ? { ...msg, ...patch } : msg,
+      ),
+    })),
   clearMessages: () => set({ messages: [] }),
 
   currentTranscript: '',
@@ -84,7 +126,7 @@ export const useSessionStore = create<SessionStateStore>((set, get) => ({
     if (!currentTranscript.trim()) return;
 
     const userMsg: ChatMessage = {
-      id: uuid(),
+      id: generateUUID(),
       role: 'user',
       content: currentTranscript.trim(),
       timestamp: Date.now(),
@@ -115,7 +157,7 @@ export const useSessionStore = create<SessionStateStore>((set, get) => ({
 
   startSession: (gatewayId) =>
     set({
-      sessionId: uuid(),
+      sessionId: generateUUID(),
       gatewayId,
       mode: 'waking',
       connectionStatus: 'connecting',
@@ -123,6 +165,11 @@ export const useSessionStore = create<SessionStateStore>((set, get) => ({
       currentTranscript: '',
       aiResponseText: '',
       isTTSSpeaking: false,
+      visionIntent: 'unknown',
+      isAnalyzingVision: false,
+      selectedFrameCount: 0,
+      speechStartAt: null,
+      speechEndAt: null,
       framesSentCount: 0,
       sessionStartTime: Date.now(),
       lastActivityAt: Date.now(),
@@ -133,7 +180,13 @@ export const useSessionStore = create<SessionStateStore>((set, get) => ({
       mode: 'idle',
       isCameraActive: false,
       isMicActive: false,
+      cameraPreviewVisible: false,
       connectionStatus: 'disconnected',
+      visionIntent: 'unknown',
+      isAnalyzingVision: false,
+      selectedFrameCount: 0,
+      speechStartAt: null,
+      speechEndAt: null,
     }),
 
   resetSession: () =>
@@ -144,10 +197,17 @@ export const useSessionStore = create<SessionStateStore>((set, get) => ({
       connectionStatus: 'disconnected',
       isCameraActive: false,
       isMicActive: false,
+      cameraPreviewVisible: false,
       messages: [],
       currentTranscript: '',
       aiResponseText: '',
       isTTSSpeaking: false,
+      visionMode: 'auto',
+      visionIntent: 'unknown',
+      isAnalyzingVision: false,
+      selectedFrameCount: 0,
+      speechStartAt: null,
+      speechEndAt: null,
       framesSentCount: 0,
       sessionStartTime: null,
       lastActivityAt: 0,

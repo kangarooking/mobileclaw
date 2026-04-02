@@ -11,7 +11,7 @@ const LOG_LEVEL_PRIORITY: Record<LogLevel, number> = {
   error: 3,
 };
 
-let currentLevel: LogLevel = 'warn'; // Default to warn to reduce noise
+let currentLevel: LogLevel = __DEV__ ? 'info' : 'warn';
 
 export function setLogLevel(level: LogLevel): void {
   currentLevel = level;

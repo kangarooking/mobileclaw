@@ -5,8 +5,12 @@
 
 import WebSocket from 'ws';
 
-const APP_ID = '7628583300';
-const TOKEN = process.env.DOUBAO_ACCESS_TOKEN || 'P928EjcKlfMe4Zt07pwaapzvs8V9zdGO';
+const APP_ID = process.env.DOUBAO_APP_ID;
+const TOKEN = process.env.DOUBAO_ACCESS_TOKEN;
+
+if (!APP_ID || !TOKEN) {
+  throw new Error('Missing DOUBAO_APP_ID or DOUBAO_ACCESS_TOKEN');
+}
 
 const PATHS = [
   '/api/v3/sauc/bigmodel_async',

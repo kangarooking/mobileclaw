@@ -15,8 +15,12 @@ import type { GatewayClient } from '../gateway/GatewayClient';
 import { useSessionStore } from '@/store/useSessionStore';
 import { EdgeTTSProvider } from './providers/EdgeTTSProvider';
 import { DoubaoTTSProvider } from './providers/DoubaoTTSProvider';
+import { audioCaptureBridge } from './AudioCaptureBridge';
+import { asrService } from './ASRService';
 import type { TTSProviderConfig } from '@/types/config';
 import { getLogger } from '@/utils/logger';
+import { uint8ToBase64 } from '@/utils/rnCompat';
+import * as FileSystem from 'expo-file-system/legacy';
 
 const log = getLogger('TTSService');
 
@@ -42,33 +46,40 @@ export class TTSService {
   private currentConfig: TTSProviderConfig | null = null;
   /** Currently speaking (for half-duplex guard) */
   private isSpeaking = false;
+  /** Whether native mic capture was active before current TTS turn */
+  private shouldResumeCapture = false;
 
   bindGateway(client: GatewayClient): void {
     this.gatewayClientRef = client;
   }
 
   async initialize(config: TTSProviderConfig): Promise<void> {
-    this.currentConfig = config;
+    this.currentConfig = null;
+    this.localProvider = null;
 
     // Initialize local provider for non-openclaw paths
+    let provider: TTSProvider | null = null;
     switch (config.type) {
       case 'edge':
-        this.localProvider = new EdgeTTSProvider();
+        provider = new EdgeTTSProvider();
         break;
       case 'doubao':
-        this.localProvider = new DoubaoTTSProvider();
+        provider = new DoubaoTTSProvider();
         break;
       case 'openclaw':
         // No local provider needed; uses gateway RPC
-        this.localProvider = null;
+        provider = null;
         break;
       default:
-        this.localProvider = null;
+        provider = null;
     }
 
-    if (this.localProvider) {
-      await this.localProvider.initialize(config);
+    if (provider) {
+      await provider.initialize(config);
     }
+
+    this.localProvider = provider;
+    this.currentConfig = config;
 
     log.info('TTSService initialized with path:', config.type);
   }
@@ -86,6 +97,16 @@ export class TTSService {
     }
 
     this.isSpeaking = true;
+    this.shouldResumeCapture = audioCaptureBridge.getIsCapturing();
+
+    if (this.shouldResumeCapture) {
+      log.info('Pausing native audio capture for half-duplex TTS');
+      try {
+        await audioCaptureBridge.stopCapture();
+      } catch (error) {
+        log.warn('Failed to pause native audio capture before TTS:', error);
+      }
+    }
 
     // ─── Half-duplex: Pause ASR while TTS speaks ────────────────
     const sessionStore = useSessionStore.getState();
@@ -101,12 +122,14 @@ export class TTSService {
         log.info('TTS playback finished');
         this.isSpeaking = false;
         sessionStore.setIsTTSSpeaking(false);
+        void this.resumeCaptureIfNeeded();
         handlers?.onDone?.();
       },
       onError: (error) => {
         log.error('TTS playback error:', error);
         this.isSpeaking = false;
         sessionStore.setIsTTSSpeaking(false);
+        void this.resumeCaptureIfNeeded();
         handlers?.onError?.(error);
       },
     };
@@ -130,6 +153,7 @@ export class TTSService {
     } catch (error) {
       this.isSpeaking = false;
       sessionStore.setIsTTSSpeaking(false);
+      void this.resumeCaptureIfNeeded();
       throw error;
     }
   }
@@ -143,6 +167,7 @@ export class TTSService {
     await this.localProvider?.stop();
     this.isSpeaking = false;
     useSessionStore.getState().setIsTTSSpeaking(false);
+    await this.resumeCaptureIfNeeded();
     log.info('TTS stopped by user/request');
   }
 
@@ -175,12 +200,16 @@ export class TTSService {
 
       if (res) {
         // Play the audio data via expo-av
+        // Write to temp file first (data: URI unreliable in expo-av on iOS)
         const { Audio } = await import('expo-av');
-        const base64 = this.arrayBufferToBase64(res as ArrayBuffer);
-        const uri = `data:audio/mp3;base64,${base64}`;
+        const base64 = uint8ToBase64(new Uint8Array(res as ArrayBuffer));
+        const tempPath = FileSystem.cacheDirectory + 'tts_openclaw.mp3';
+        await FileSystem.writeAsStringAsync(tempPath, base64, {
+          encoding: FileSystem.EncodingType.Base64,
+        });
 
         const { sound } = await Audio.Sound.createAsync(
-          { uri },
+          { uri: tempPath },
           { shouldPlay: true },
         );
 
@@ -205,14 +234,25 @@ export class TTSService {
   }
 
   private arrayBufferToBase64(buffer: ArrayBuffer): string {
-    const bytes = new Uint8Array(buffer);
-    let binary = '';
-    const CHUNK_SIZE = 8192;
-    for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
-      const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, bytes.length));
-      binary += String.fromCharCode(...chunk);
+    return uint8ToBase64(new Uint8Array(buffer));
+  }
+
+  private async resumeCaptureIfNeeded(): Promise<void> {
+    if (!this.shouldResumeCapture) return;
+
+    this.shouldResumeCapture = false;
+    try {
+      await asrService.prepareNextTurn();
+    } catch (error) {
+      log.warn('Failed to prepare ASR for next turn after TTS:', error);
     }
-    return btoa(binary);
+
+    try {
+      log.info('Resuming native audio capture after TTS');
+      await audioCaptureBridge.startCapture();
+    } catch (error) {
+      log.warn('Failed to resume native audio capture after TTS:', error);
+    }
   }
 }
 
