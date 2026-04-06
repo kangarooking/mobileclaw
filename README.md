@@ -3,6 +3,15 @@
 MobileClaw 是一个面向 [OpenClaw](https://github.com/openclaw/openclaw) 的多模态移动客户端。  
 它把手机变成一个“能看、能听、能说”的 AI 对讲终端：支持语音对话、摄像头预览、按需多帧视觉识别、TTS 播报和会话记录。
 
+<p>
+  <a href="https://github.com/kangarooking/mobileclaw/releases/tag/v1.0.0">
+    <img alt="下载 APK" src="https://img.shields.io/badge/下载%20APK-v1.0.0-cc2b1d?style=for-the-badge" />
+  </a>
+  <a href="https://github.com/kangarooking/mobileclaw/releases/download/v1.0.0/MobileClaw-1.0.0-android.apk">
+    <img alt="Android APK" src="https://img.shields.io/badge/Android-直接安装-1f8b4c?style=for-the-badge" />
+  </a>
+</p>
+
 ## 演示视频
 
 ### 语音对话演示
