@@ -7,6 +7,7 @@ import type { AppConfig } from '@/types/config';
 import { DEFAULT_CONFIG } from '@/types/config';
 
 const STORAGE_KEY = '@mobileclaw_config';
+const ONBOARDING_KEY = '@mobileclaw_onboarding_complete';
 
 export class ConfigStore {
   static async load(): Promise<AppConfig> {
@@ -27,5 +28,21 @@ export class ConfigStore {
 
   static async reset(): Promise<void> {
     await AsyncStorage.removeItem(STORAGE_KEY);
+  }
+
+  static async isOnboardingComplete(): Promise<boolean> {
+    try {
+      return (await AsyncStorage.getItem(ONBOARDING_KEY)) === '1';
+    } catch {
+      return false;
+    }
+  }
+
+  static async setOnboardingComplete(complete: boolean): Promise<void> {
+    if (complete) {
+      await AsyncStorage.setItem(ONBOARDING_KEY, '1');
+      return;
+    }
+    await AsyncStorage.removeItem(ONBOARDING_KEY);
   }
 }

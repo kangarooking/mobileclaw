@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { View, Text, TextInput, TouchableOpacity, ScrollView, Switch, StyleSheet } from 'react-native';
+import { Alert, View, Text, TextInput, TouchableOpacity, ScrollView, Switch, StyleSheet } from 'react-native';
 import { useAppStore } from '@/store/useAppStore';
 import { SecureStorage } from '@/services/storage/SecureStorage';
 
@@ -17,8 +17,8 @@ const HUD = {
   danger: '#ff6670',
 };
 
-export function SettingsScreen() {
-  const { config, addGateway, removeGateway, updateConfig } = useAppStore();
+export function SettingsScreen({ navigation }: { navigation: any }) {
+  const { config, addGateway, removeGateway, updateConfig, updateGateway, setActiveGateway, activeGateway } = useAppStore();
   const [newGwName, setNewGwName] = useState('');
   const [newGwUrl, setNewGwUrl] = useState('');
   const [newGwToken, setNewGwToken] = useState('');
@@ -35,6 +35,10 @@ export function SettingsScreen() {
   const [wakeWord, setWakeWord] = useState(config.wakeWord);
   const [speechFrameMaxCount, setSpeechFrameMaxCount] = useState(String(config.video.speechFrameMaxCount));
   const [replyTimeoutMs, setReplyTimeoutMs] = useState(String(config.video.replyTimeoutMs));
+  const [editingGatewayId, setEditingGatewayId] = useState<string | null>(null);
+  const [editingGatewayName, setEditingGatewayName] = useState('');
+  const [editingGatewayUrl, setEditingGatewayUrl] = useState('');
+  const [editingGatewayToken, setEditingGatewayToken] = useState('');
 
   useEffect(() => {
     (async () => {
@@ -102,6 +106,7 @@ export function SettingsScreen() {
         accessToken: asrAccessToken.trim() || undefined,
       },
     });
+    Alert.alert('保存成功', '语音识别凭证已保存。');
   };
 
   const handleSaveTTSCredentials = async () => {
@@ -128,6 +133,7 @@ export function SettingsScreen() {
         voiceType: ttsVoiceType.trim() || undefined,
       },
     });
+    Alert.alert('保存成功', '语音播报凭证已保存。');
   };
 
   const handleAddGateway = async () => {
@@ -148,6 +154,42 @@ export function SettingsScreen() {
     setNewGwName('');
     setNewGwUrl('');
     setNewGwToken('');
+    Alert.alert('保存成功', '网关实例已添加。');
+  };
+
+  const handleEditGateway = async (gatewayId: string) => {
+    const gateway = config.gateways.find((item) => item.id === gatewayId);
+    if (!gateway) return;
+    const token = (await SecureStorage.getGatewayToken(gateway.id)) || '';
+    setEditingGatewayId(gateway.id);
+    setEditingGatewayName(gateway.name);
+    setEditingGatewayUrl(gateway.wsUrl);
+    setEditingGatewayToken(token);
+  };
+
+  const handleSaveGatewayEdit = async () => {
+    if (!editingGatewayId) return;
+    updateGateway(editingGatewayId, {
+      name: editingGatewayName.trim() || '未命名网关',
+      wsUrl: editingGatewayUrl.trim(),
+    });
+    if (editingGatewayToken.trim()) {
+      await SecureStorage.setGatewayToken(editingGatewayId, editingGatewayToken.trim());
+    } else {
+      await SecureStorage.removeItem(`gw_${editingGatewayId}_token`);
+    }
+    setEditingGatewayId(null);
+    setEditingGatewayName('');
+    setEditingGatewayUrl('');
+    setEditingGatewayToken('');
+    Alert.alert('保存成功', '网关实例已更新。');
+  };
+
+  const handleCancelGatewayEdit = () => {
+    setEditingGatewayId(null);
+    setEditingGatewayName('');
+    setEditingGatewayUrl('');
+    setEditingGatewayToken('');
   };
 
   const handleSaveVisionApiKey = async () => {
@@ -156,6 +198,7 @@ export function SettingsScreen() {
     } else {
       await SecureStorage.removeItem('vision_api_key');
     }
+    Alert.alert('保存成功', '视觉意图识别凭证已保存。');
   };
 
   const handleSaveVideoSettings = () => {
@@ -172,6 +215,7 @@ export function SettingsScreen() {
 
     setSpeechFrameMaxCount(String(nextSpeechFrameMaxCount));
     setReplyTimeoutMs(String(nextReplyTimeoutMs));
+    Alert.alert('保存成功', '视频与回复参数已保存。');
   };
 
   const handleSaveWakeWord = () => {
@@ -186,6 +230,7 @@ export function SettingsScreen() {
     });
 
     setWakeWord(normalized || '龙虾');
+    Alert.alert('保存成功', '唤醒词已保存。');
   };
 
   return (
@@ -205,19 +250,79 @@ export function SettingsScreen() {
         showsVerticalScrollIndicator={false}
       >
         <Section title="网关实例" subtitle="接入 OpenClaw 的地址、名称与令牌。">
+          <View style={styles.gatewayImportCallout}>
+            <View style={styles.gatewayImportTextWrap}>
+              <Text style={styles.gatewayImportTitle}>扫码导入更省事</Text>
+              <Text style={styles.gatewayImportHint}>
+                OpenClaw 所在机器执行 `openclaw qr` 可生成二维码。扫码导入后，下面的手填入口依然保留。
+              </Text>
+            </View>
+            <TouchableOpacity
+              onPress={() => navigation.navigate('GatewayQrScanner')}
+              style={styles.scanChip}
+              activeOpacity={0.84}
+            >
+              <Text style={styles.scanChipText}>扫码</Text>
+            </TouchableOpacity>
+          </View>
+
           {config.gateways.map((gw) => (
             <View key={gw.id} style={styles.gatewayCard}>
               <View style={styles.gatewayRow}>
                 <View style={styles.gatewayInfo}>
                   <Text style={styles.gatewayName}>{gw.avatarEmoji} {gw.name}</Text>
                   <Text style={styles.gatewayUrl}>{gw.wsUrl}</Text>
+                  <Text style={styles.gatewayMeta}>
+                    {activeGateway?.id === gw.id ? '当前使用中' : '未选中'}
+                  </Text>
                 </View>
-                <TouchableOpacity onPress={() => removeGateway(gw.id)} style={styles.deleteChip}>
-                  <Text style={styles.deleteChipText}>删除</Text>
-                </TouchableOpacity>
+                <View style={styles.gatewayActions}>
+                  <TouchableOpacity onPress={() => setActiveGateway(gw)} style={styles.selectChip}>
+                    <Text style={styles.selectChipText}>{activeGateway?.id === gw.id ? '已选中' : '设为当前'}</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity onPress={() => handleEditGateway(gw.id)} style={styles.editChip}>
+                    <Text style={styles.editChipText}>编辑</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity onPress={() => removeGateway(gw.id)} style={styles.deleteChip}>
+                    <Text style={styles.deleteChipText}>删除</Text>
+                  </TouchableOpacity>
+                </View>
               </View>
             </View>
           ))}
+
+          {editingGatewayId ? (
+            <View style={styles.formBlock}>
+              <Text style={styles.editTitle}>编辑网关</Text>
+              <FormField
+                value={editingGatewayName}
+                onChangeText={setEditingGatewayName}
+                placeholder="实例名称"
+              />
+              <FormField
+                value={editingGatewayUrl}
+                onChangeText={setEditingGatewayUrl}
+                placeholder="WebSocket 地址"
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+              <FormField
+                value={editingGatewayToken}
+                onChangeText={setEditingGatewayToken}
+                placeholder="认证令牌"
+                secureTextEntry
+              />
+              <Text style={styles.helperText}>扫码导入后的 token 也会在这里读取出来，方便确认和修改。手机接电脑时，地址请填局域网 IP，不要填 `127.0.0.1`。</Text>
+              <View style={styles.editButtonRow}>
+                <TouchableOpacity onPress={handleCancelGatewayEdit} style={styles.secondaryInlineButton} activeOpacity={0.84}>
+                  <Text style={styles.secondaryInlineButtonText}>取消</Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={handleSaveGatewayEdit} style={styles.primaryInlineButton} activeOpacity={0.84}>
+                  <Text style={styles.primaryInlineButtonText}>保存修改</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          ) : null}
 
           <View style={styles.formBlock}>
             <FormField
@@ -228,7 +333,7 @@ export function SettingsScreen() {
             <FormField
               value={newGwUrl}
               onChangeText={setNewGwUrl}
-              placeholder="WebSocket 地址，例如：ws://127.0.0.1:18789"
+              placeholder="WebSocket 地址，例如：ws://192.168.1.6:18789"
               autoCapitalize="none"
               autoCorrect={false}
             />
@@ -238,6 +343,7 @@ export function SettingsScreen() {
               placeholder="认证令牌"
               secureTextEntry
             />
+            <Text style={styles.helperText}>手机连接电脑上的 OpenClaw 时，不要填写 `127.0.0.1` 或 `localhost`，要填电脑的局域网 IP。</Text>
             <PrimaryButton label="添加网关" onPress={handleAddGateway} />
           </View>
         </Section>
@@ -554,6 +660,44 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 18,
   },
+  gatewayImportCallout: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: HUD.line,
+    backgroundColor: HUD.accentSoft,
+    padding: 12,
+  },
+  gatewayImportTextWrap: {
+    flex: 1,
+  },
+  gatewayImportTitle: {
+    color: HUD.text,
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  gatewayImportHint: {
+    marginTop: 4,
+    color: HUD.textMuted,
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  scanChip: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: HUD.lineStrong,
+    backgroundColor: 'rgba(0, 229, 255, 0.12)',
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+  },
+  scanChipText: {
+    color: HUD.accent,
+    fontSize: 13,
+    fontWeight: '800',
+  },
   gatewayCard: {
     borderRadius: 18,
     borderWidth: 1,
@@ -565,7 +709,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     gap: 12,
-    alignItems: 'center',
+    alignItems: 'flex-start',
   },
   gatewayInfo: {
     flex: 1,
@@ -581,6 +725,42 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 18,
   },
+  gatewayMeta: {
+    marginTop: 6,
+    color: HUD.accent,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  gatewayActions: {
+    alignItems: 'flex-end',
+    gap: 8,
+  },
+  selectChip: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 229, 255, 0.24)',
+    backgroundColor: 'rgba(4, 31, 44, 0.84)',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  selectChipText: {
+    color: HUD.accent,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  editChip: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(115, 240, 255, 0.18)',
+    backgroundColor: 'rgba(6, 22, 34, 0.72)',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  editChipText: {
+    color: HUD.text,
+    fontSize: 12,
+    fontWeight: '700',
+  },
   deleteChip: {
     borderRadius: 999,
     borderWidth: 1,
@@ -593,6 +773,43 @@ const styles = StyleSheet.create({
     color: '#ff8f98',
     fontSize: 12,
     fontWeight: '700',
+  },
+  editTitle: {
+    color: HUD.text,
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  editButtonRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  secondaryInlineButton: {
+    flex: 1,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(115, 240, 255, 0.14)',
+    backgroundColor: 'rgba(4, 17, 27, 0.76)',
+    alignItems: 'center',
+    paddingVertical: 12,
+  },
+  secondaryInlineButtonText: {
+    color: HUD.textMuted,
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  primaryInlineButton: {
+    flex: 1,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: HUD.lineStrong,
+    backgroundColor: HUD.accentSoft,
+    alignItems: 'center',
+    paddingVertical: 12,
+  },
+  primaryInlineButtonText: {
+    color: HUD.accent,
+    fontSize: 14,
+    fontWeight: '800',
   },
   formBlock: {
     borderRadius: 20,

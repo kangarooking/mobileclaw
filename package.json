@@ -4,11 +4,16 @@
   "main": "index.ts",
   "scripts": {
     "start": "expo start --dev-client",
+    "start:release": "expo start",
     "android": "expo run:android",
     "ios": "expo run:ios",
     "prebuild": "npx expo prebuild --clean --platform ios,android",
     "android:env": "bash ./scripts/setup-android-env.sh",
-    "android:check": "bash ./scripts/check-android-env.sh"
+    "android:check": "bash ./scripts/check-android-env.sh",
+    "build:android:preview": "eas build --platform android --profile preview",
+    "build:android:production": "eas build --platform android --profile production",
+    "build:ios:preview": "eas build --platform ios --profile preview",
+    "build:ios:production": "eas build --platform ios --profile production"
   },
   "dependencies": {
     "@react-native-async-storage/async-storage": "1.24.0",
@@ -16,6 +21,7 @@
     "@react-navigation/native-stack": "^7.2.5",
     "expo": "~54.0.33",
     "expo-av": "^16.0.8",
+    "expo-camera": "~17.0.10",
     "expo-dev-client": "^55.0.19",
     "expo-file-system": "~19.0.21",
     "expo-secure-store": "^55.0.9",
@@ -42,6 +48,7 @@
     "@react-native-community/cli": "^20.1.3",
     "@types/react": "~19.1.0",
     "@types/uuid": "^10.0.0",
+    "babel-preset-expo": "^55.0.15",
     "eas-cli": "^18.4.0",
     "typescript": "~5.9.2",
     "ws": "^8.20.0"

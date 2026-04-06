@@ -17,6 +17,8 @@ interface AppState {
   setActiveGateway: (gateway: GatewayConfig | null) => void;
   addGateway: (gateway: Omit<GatewayConfig, 'id'>) => string;
   removeGateway: (id: string) => void;
+  updateGateway: (id: string, partial: Partial<Omit<GatewayConfig, 'id'>>) => void;
+  importGatewaySetup: (setup: { name?: string; wsUrl: string; token?: string; description?: string }) => Promise<string>;
 
   // Permissions
   permissions: {
@@ -27,7 +29,7 @@ interface AppState {
 
   // App lifecycle
   isFirstLaunch: boolean;
-  markFirstLaunchComplete: () => void;
+  markFirstLaunchComplete: () => Promise<void>;
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -45,6 +47,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   loadConfig: async () => {
     try {
       const saved = await ConfigStore.load();
+      const onboardingComplete = await ConfigStore.isOnboardingComplete();
       if (saved && Object.keys(saved).length > 0) {
         const merged = {
           ...DEFAULT_CONFIG,
@@ -95,8 +98,16 @@ export const useAppStore = create<AppState>((set, get) => ({
             };
           }
         }
-        set({ config: merged });
+        const activeGateway =
+          merged.gateways.find((gateway) => gateway.id === merged.activeGatewayId) ?? null;
+        set({
+          config: merged,
+          activeGateway,
+          isFirstLaunch: !onboardingComplete && merged.gateways.length === 0,
+        });
+        return;
       }
+      set({ isFirstLaunch: !onboardingComplete });
     } catch (e) {
       console.warn('[useAppStore] Failed to load config:', e);
     }
@@ -114,8 +125,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   // Gateway management
   activeGateway: null,
 
-  setActiveGateway: (gateway) =>
-    set({ activeGateway: gateway, config: { ...get().config, activeGatewayId: gateway?.id ?? null } }),
+  setActiveGateway: (gateway) => {
+    set({ activeGateway: gateway, config: { ...get().config, activeGatewayId: gateway?.id ?? null } });
+    get().saveConfig();
+  },
 
   addGateway: (gateway) => {
     const id = `gw_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -144,6 +157,77 @@ export const useAppStore = create<AppState>((set, get) => ({
     get().saveConfig();
   },
 
+  updateGateway: (id, partial) => {
+    set((state) => {
+      const gateways = state.config.gateways.map((gateway) =>
+        gateway.id === id ? { ...gateway, ...partial, id } : gateway,
+      );
+      const activeGateway =
+        state.activeGateway?.id === id
+          ? gateways.find((gateway) => gateway.id === id) ?? null
+          : state.activeGateway;
+      return {
+        config: {
+          ...state.config,
+          gateways,
+        },
+        activeGateway,
+      };
+    });
+    get().saveConfig();
+  },
+
+  importGatewaySetup: async (setup) => {
+    const trimmedUrl = setup.wsUrl.trim();
+    const token = setup.token?.trim();
+    const existing = get().config.gateways.find((gateway) => gateway.wsUrl === trimmedUrl);
+
+    if (existing) {
+      if (setup.name?.trim() || setup.description?.trim()) {
+        get().updateGateway(existing.id, {
+          name: setup.name?.trim() || existing.name,
+          description: setup.description?.trim() || existing.description,
+        });
+      }
+      if (token) {
+        await import('@/services/storage/SecureStorage').then(({ SecureStorage }) =>
+          SecureStorage.setGatewayToken(existing.id, token),
+        );
+      }
+      const updatedExisting =
+        get().config.gateways.find((gateway) => gateway.id === existing.id) ?? existing;
+      set((state) => ({
+        activeGateway: updatedExisting,
+        config: {
+          ...state.config,
+          activeGatewayId: existing.id,
+        },
+      }));
+      await get().saveConfig();
+      return existing.id;
+    }
+
+    const id = get().addGateway({
+      name: setup.name?.trim() || `龙虾 ${get().config.gateways.length + 1}`,
+      wsUrl: trimmedUrl,
+      description: setup.description?.trim() || '',
+      isActive: true,
+      avatarEmoji: '🦞',
+    });
+
+    if (token) {
+      await import('@/services/storage/SecureStorage').then(({ SecureStorage }) =>
+        SecureStorage.setGatewayToken(id, token),
+      );
+    }
+
+    const created = get().config.gateways.find((gateway) => gateway.id === id) ?? null;
+    if (created) {
+      get().setActiveGateway(created);
+    }
+    return id;
+  },
+
   // Permissions
   permissions: {
     camera: 'not_determined',
@@ -157,5 +241,8 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   // App lifecycle
   isFirstLaunch: true,
-  markFirstLaunchComplete: () => set({ isFirstLaunch: false }),
+  markFirstLaunchComplete: async () => {
+    set({ isFirstLaunch: false });
+    await ConfigStore.setOnboardingComplete(true);
+  },
 }));

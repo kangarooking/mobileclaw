@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { View, Text, TouchableOpacity, ScrollView, Switch, Alert, StyleSheet } from 'react-native';
+import { View, Text, TouchableOpacity, ScrollView, Switch, Alert, StyleSheet, Image } from 'react-native';
 import { useAppStore } from '@/store/useAppStore';
 import type { GatewayConfig } from '@/types/config';
 import { GatewayCard } from '@/components/common/GatewayCard';
@@ -22,6 +22,12 @@ export function HomeScreen({ navigation }: { navigation: { navigate: (name: stri
     setDiagResult('正在检测网关链路...\n');
 
     const url = activeGateway.wsUrl;
+    const hostHint = getGatewayHostHint(url);
+    if (hostHint) {
+      setDiagResult(hostHint);
+      setDiagRunning(false);
+      return;
+    }
     const lines: string[] = [];
     const add = (line: string) => {
       lines.push(line);
@@ -90,6 +96,13 @@ export function HomeScreen({ navigation }: { navigation: { navigate: (name: stri
 
   const handleActivate = async () => {
     try {
+      if (activeGateway) {
+        const hostHint = getGatewayHostHint(activeGateway.wsUrl);
+        if (hostHint) {
+          Alert.alert('网关地址不可用', hostHint, [{ text: '知道了' }]);
+          return;
+        }
+      }
       await wakeUpManager.activate(undefined, { useCamera });
       navigation.navigate('Session');
     } catch (error: any) {
@@ -99,7 +112,9 @@ export function HomeScreen({ navigation }: { navigation: { navigate: (name: stri
           ? '当前设备尚未通过 Gateway 配对，请先在 OpenClaw 侧批准该设备后再重试。'
           : /already connecting/i.test(rawMsg)
             ? '网关正在建立连接，请稍等一秒后再试。'
-          : rawMsg;
+          : /tcp-connect/i.test(rawMsg)
+            ? `无法连到网关，请检查地址是否可从手机访问。\n\n当前地址：${activeGateway?.wsUrl || '未设置'}`
+            : rawMsg;
       Alert.alert('启动失败', normalizedMsg, [{ text: '知道了' }]);
     }
   };
@@ -110,10 +125,13 @@ export function HomeScreen({ navigation }: { navigation: { navigate: (name: stri
       <View style={styles.haloBottom} />
 
       <View style={styles.header}>
-        <View>
+        <View style={styles.headerBrand}>
+          <Image source={require('../../assets/icon.png')} style={styles.logo} resizeMode="contain" />
+          <View style={styles.headerTextWrap}>
           <Text style={styles.kicker}>系统入口</Text>
           <Text style={styles.title}>MobileClaw 控台</Text>
           <Text style={styles.subtitle}>语音、视觉与会话链路就绪后即可接入龙虾</Text>
+          </View>
         </View>
         <TouchableOpacity onPress={() => navigation.navigate('Settings')} style={styles.settingsButton}>
           <Text style={styles.settingsButtonText}>参数</Text>
@@ -196,6 +214,19 @@ export function HomeScreen({ navigation }: { navigation: { navigate: (name: stri
   );
 }
 
+function getGatewayHostHint(rawUrl: string): string | null {
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    if (host === '127.0.0.1' || host === 'localhost' || host === '::1') {
+      return `当前网关地址是 ${host}，手机无法连接你电脑上的本地回环地址。\n\n请把网关地址改成运行 OpenClaw 那台电脑的局域网 IP，例如：ws://192.168.1.6:18789`;
+    }
+    return null;
+  } catch {
+    return `当前网关地址格式不正确：${rawUrl}`;
+  }
+}
+
 const styles = StyleSheet.create({
   container: {
     flex: 1,
@@ -227,6 +258,24 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'flex-start',
     marginBottom: 14,
+  },
+  headerBrand: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    flex: 1,
+    paddingRight: 12,
+  },
+  headerTextWrap: {
+    flex: 1,
+  },
+  logo: {
+    width: 54,
+    height: 54,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(115, 240, 255, 0.22)',
+    backgroundColor: 'rgba(6, 18, 29, 0.96)',
   },
   kicker: {
     color: '#73f0ff',
